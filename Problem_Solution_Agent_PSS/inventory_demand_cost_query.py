@@ -7,48 +7,32 @@ Build a plant-level table for one or more OBS parts across plants 4020, 4055,
 
 Verified Databricks source mapping
 ---------------------------------
-1. Make / Buy
-   - Schema.Table: prd.ud_gsco.vw_active_items
-   - Column: prcrmnttype
-   - Fallback: prd.ud_gsco.material_master.prcrmnttype
+1. Make / Buy, MRP, Description, Standard Cost
+    - Schema.Table: prd.ud_gsco.material_master
+    - Columns: prcrmnttype, mrpprfl, materialdesc, stdcost_usd
 
-2. MRP Profile
-   - Schema.Table: prd.ud_gsco.vw_active_items
-   - Column: mrpprfl
-   - Fallback: prd.ud_gsco.material_master.mrpprfl
+2. Inventory (On Hand)
+    - Schema.Table: prd.pd_inv.summonhandinv
+    - Column: qty
+    - Logic: SUM(qty) by materialnum, plantcode
 
-3. Inventory
-   - On Hand (OH)
-     - Schema.Table: prd.ud_gsco.vw_active_items
-     - Column: nettableoh
-   - On Order (OO)
-     - Schema.Table: prd.pd_mm.factpol
-     - Column: openpoqty
-     - Logic: SUM(openpoqty) by materialnum, plantcd
+3. Inventory (On Order - Open PO only)
+    - Schema.Table: prd.ud_agsocebi.open_purchase_order
+    - Columns: quantity, quantity_of_goods_received
+    - Logic: SUM(quantity - quantity_of_goods_received) where remaining qty > 0
 
-4. Gross Demand
-   - 13 weeks
-     - Schema.Table: prd.ud_gsco.vw_active_items
-     - Column: demand13wk
-   - 26 weeks
-     - Schema.Table: prd.ud_gsco.vw_active_items
-     - Column: demand26wk
-   - 52 weeks
-     - Schema.Table: prd.ud_gsco.vw_active_items
-     - Columns: ssg_52_wk_dmd, ags_52_wk_dmd
-     - Logic: COALESCE(ssg_52_wk_dmd, 0) + COALESCE(ags_52_wk_dmd, 0)
+4. Gross Demand (latest snapshot, excluding PlannedPO)
+    - Schema.Table: prd.pd_mm.factknxssplyconsmp
+    - Columns: snapshotdate, spart, partsite, stype, dduedate, dqty
+    - Logic:
+      - latest snapshot per (spart, partsite)
+      - exclude stype = 'PlannedPO'
+      - bucket and sum TRY_CAST(dqty) into 13/26/52-week windows
 
-5. Standard Cost / Inventory Cost
-   - Standard Cost USD
-     - Schema.Table: prd.ud_gsco.vw_active_items
-     - Column: stdcost
-     - Fallback: prd.ud_gsco.material_master.stdcost_usd
-   - Inventory Cost USD
-     - Logic: On Hand Qty * Standard Cost USD
-   - Supply Cost USD
-     - Logic: (On Hand Qty + On Order Qty) * Standard Cost USD
-     - Included because the current UI tab historically treated OH + OO as the
-       cost basis.
+5. Cost behavior
+    - Standard Cost USD is returned only when on-hand inventory exists (> 0)
+    - Inventory Cost USD = on_hand_qty * standard_cost_usd
+    - Supply Cost USD = (on_hand_qty + on_order_qty) * standard_cost_usd
 
 Notes
 -----
@@ -137,76 +121,121 @@ material_master AS (
     SELECT
         materialnum,
         plantcd,
-        materialdesc,
-        mrpprfl,
-        prcrmnttype,
-        stdcost_usd
+        MAX(materialdesc) AS materialdesc,
+        MAX(mrpprfl) AS mrpprfl,
+        MAX(prcrmnttype) AS prcrmnttype,
+        MAX(stdcost_usd) AS stdcost_usd
     FROM prd.ud_gsco.material_master
     WHERE materialnum IN ({part_filter})
       AND plantcd IN ({plant_filter})
+    GROUP BY materialnum, plantcd
 ),
-active_items AS (
+on_hand_inventory AS (
     SELECT
         materialnum,
-        plantcd,
-        materialdesc,
-        prcrmnttype,
-        mrpprfl,
-        nettableoh,
-        demand13wk,
-        demand26wk,
-        COALESCE(ssg_52_wk_dmd, 0) + COALESCE(ags_52_wk_dmd, 0) AS demand52wk,
-        stdcost
-    FROM prd.ud_gsco.vw_active_items
+        plantcode,
+        SUM(COALESCE(qty, 0)) AS on_hand_qty
+    FROM prd.pd_inv.summonhandinv
     WHERE materialnum IN ({part_filter})
-      AND plantcd IN ({plant_filter})
+      AND plantcode IN ({plant_filter})
+    GROUP BY materialnum, plantcode
 ),
 open_po AS (
     SELECT
-        materialnum,
-        plantcd,
-        SUM(COALESCE(openpoqty, 0)) AS open_order_qty
-    FROM prd.pd_mm.factpol
-    WHERE materialnum IN ({part_filter})
-      AND plantcd IN ({plant_filter})
-      AND rflg = 1
-    GROUP BY materialnum, plantcd
+        material_number AS materialnum,
+        plant_code AS plantcd,
+        SUM(COALESCE(quantity, 0) - COALESCE(quantity_of_goods_received, 0)) AS open_order_qty
+    FROM prd.ud_agsocebi.open_purchase_order
+    WHERE material_number IN ({part_filter})
+      AND plant_code IN ({plant_filter})
+      AND (COALESCE(quantity, 0) - COALESCE(quantity_of_goods_received, 0)) > 0
+    GROUP BY material_number, plant_code
+),
+latest_snapshot AS (
+    SELECT
+        spart AS materialnum,
+        partsite AS plantcd,
+        MAX(snapshotdate) AS snapshotdate
+    FROM prd.pd_mm.factknxssplyconsmp
+    WHERE spart IN ({part_filter})
+      AND partsite IN ({plant_filter})
+    GROUP BY spart, partsite
+),
+demand_buckets AS (
+    SELECT
+        f.spart AS materialnum,
+        f.partsite AS plantcd,
+        SUM(CASE
+                WHEN DATEDIFF(TO_DATE(f.dduedate), CURRENT_DATE()) BETWEEN 0 AND 91
+                    THEN COALESCE(TRY_CAST(f.dqty AS DECIMAL(38, 3)), 0)
+                ELSE 0
+            END) AS gross_demand_13w,
+        SUM(CASE
+                WHEN DATEDIFF(TO_DATE(f.dduedate), CURRENT_DATE()) BETWEEN 0 AND 182
+                    THEN COALESCE(TRY_CAST(f.dqty AS DECIMAL(38, 3)), 0)
+                ELSE 0
+            END) AS gross_demand_26w,
+        SUM(CASE
+                WHEN DATEDIFF(TO_DATE(f.dduedate), CURRENT_DATE()) BETWEEN 0 AND 364
+                    THEN COALESCE(TRY_CAST(f.dqty AS DECIMAL(38, 3)), 0)
+                ELSE 0
+            END) AS gross_demand_52w
+    FROM prd.pd_mm.factknxssplyconsmp f
+    INNER JOIN latest_snapshot ls
+        ON f.spart = ls.materialnum
+       AND f.partsite = ls.plantcd
+       AND f.snapshotdate = ls.snapshotdate
+    WHERE COALESCE(f.stype, '') <> 'PlannedPO'
+    GROUP BY f.spart, f.partsite
 )
 SELECT
     grid.part_number                                              AS part_number,
-    COALESCE(ai.materialdesc, mm.materialdesc, '')                AS part_description,
+    COALESCE(mm.materialdesc, '')                                  AS part_description,
     grid.plant                                                    AS plant,
     CASE
-        WHEN UPPER(COALESCE(ai.prcrmnttype, '')) IN ('MAKE', 'BUY')
-            THEN UPPER(ai.prcrmnttype)
+        WHEN UPPER(COALESCE(mm.prcrmnttype, '')) IN ('MAKE', 'BUY')
+            THEN UPPER(mm.prcrmnttype)
         WHEN COALESCE(mm.prcrmnttype, '') = 'E'
             THEN 'MAKE'
         WHEN COALESCE(mm.prcrmnttype, '') = 'F'
             THEN 'BUY'
-        ELSE COALESCE(ai.prcrmnttype, mm.prcrmnttype, '')
+        ELSE COALESCE(mm.prcrmnttype, '')
     END                                                           AS make_buy,
-    COALESCE(ai.mrpprfl, mm.mrpprfl, '')                          AS mrp_profile,
-    CAST(COALESCE(ai.nettableoh, 0) AS DECIMAL(18, 3))            AS on_hand_qty,
+    COALESCE(mm.mrpprfl, '')                                       AS mrp_profile,
+    CAST(COALESCE(oh.on_hand_qty, 0) AS DECIMAL(18, 3))            AS on_hand_qty,
     CAST(COALESCE(po.open_order_qty, 0) AS DECIMAL(18, 3))        AS on_order_qty,
-    CAST(COALESCE(ai.demand13wk, 0) AS DECIMAL(18, 3))            AS gross_demand_13w,
-    CAST(COALESCE(ai.demand26wk, 0) AS DECIMAL(18, 3))            AS gross_demand_26w,
-    CAST(COALESCE(ai.demand52wk, 0) AS DECIMAL(18, 3))            AS gross_demand_52w,
-    CAST(COALESCE(ai.stdcost, mm.stdcost_usd, 0) AS DECIMAL(18, 3)) AS standard_cost_usd,
-    CAST(COALESCE(ai.nettableoh, 0) * COALESCE(ai.stdcost, mm.stdcost_usd, 0) AS DECIMAL(18, 3))
+    CAST(COALESCE(dem.gross_demand_13w, 0) AS DECIMAL(18, 3))     AS gross_demand_13w,
+    CAST(COALESCE(dem.gross_demand_26w, 0) AS DECIMAL(18, 3))     AS gross_demand_26w,
+    CAST(COALESCE(dem.gross_demand_52w, 0) AS DECIMAL(18, 3))     AS gross_demand_52w,
+    CAST(CASE
+            WHEN COALESCE(oh.on_hand_qty, 0) > 0 THEN COALESCE(mm.stdcost_usd, 0)
+            ELSE 0
+        END AS DECIMAL(18, 3))                                    AS standard_cost_usd,
+    CAST(COALESCE(oh.on_hand_qty, 0) *
+        CASE
+            WHEN COALESCE(oh.on_hand_qty, 0) > 0 THEN COALESCE(mm.stdcost_usd, 0)
+            ELSE 0
+        END AS DECIMAL(18, 3))
                                                                  AS inventory_cost_usd,
-    CAST((COALESCE(ai.nettableoh, 0) + COALESCE(po.open_order_qty, 0))
-        * COALESCE(ai.stdcost, mm.stdcost_usd, 0) AS DECIMAL(18, 3))
+    CAST((COALESCE(oh.on_hand_qty, 0) + COALESCE(po.open_order_qty, 0)) *
+        CASE
+            WHEN COALESCE(oh.on_hand_qty, 0) > 0 THEN COALESCE(mm.stdcost_usd, 0)
+            ELSE 0
+        END AS DECIMAL(18, 3))
                                                                  AS supply_cost_usd
 FROM part_plant_grid grid
 LEFT JOIN material_master mm
     ON mm.materialnum = grid.part_number
    AND mm.plantcd = grid.plant
-LEFT JOIN active_items ai
-    ON ai.materialnum = grid.part_number
-   AND ai.plantcd = grid.plant
+LEFT JOIN on_hand_inventory oh
+    ON oh.materialnum = grid.part_number
+   AND oh.plantcode = grid.plant
 LEFT JOIN open_po po
     ON po.materialnum = grid.part_number
    AND po.plantcd = grid.plant
+LEFT JOIN demand_buckets dem
+    ON dem.materialnum = grid.part_number
+   AND dem.plantcd = grid.plant
 ORDER BY grid.part_number, grid.plant
 """.strip()
 
