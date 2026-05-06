@@ -1,0 +1,8 @@
+Traceback (most recent call last):
+  File "c:\Users\e187725\OneDrive - Applied Materials\Desktop\Orphan Anlsysis Pyt\Problem_Solution_Agent_11\ecr_kit_ui_updated_v7_5_3.py", line 697, in <module>
+    if __name__=='__main__': run()
+                             ~~~^^
+  File "c:\Users\e187725\OneDrive - Applied Materials\Desktop\Orphan Anlsysis Pyt\Problem_Solution_Agent_11\ecr_kit_ui_updated_v7_5_3.py", line 695, in run
+    win=MainWindow(); win.show(); sys.exit(app.exec())
+                                           ~~~~~~~~^^
+KeyboardInterrupt

@@ -1,0 +1,158 @@
+{
+  "front_page": {
+    "fields": {
+      "ecr_no": "",
+      "eco_primer": "",
+      "ec_category": "",
+      "bu": "",
+      "tco": "",
+      "project_no": "",
+      "product": "",
+      "affected_modules": "",
+      "place": "",
+      "title": "",
+      "problem": "",
+      "solution": ""
+    },
+    "checklist": [
+      {
+        "slno": "1",
+        "completion": false,
+        "category": "Project Association",
+        "validation": "Does the ECR include a Project (PCR)?",
+        "action_owner": "",
+        "due_date": "",
+        "comments": ""
+      },
+      {
+        "slno": "2",
+        "completion": false,
+        "category": "Safety & Compliance",
+        "validation": "Provide PSER details if any safety incident occurred.",
+        "action_owner": "",
+        "due_date": "",
+        "comments": ""
+      },
+      {
+        "slno": "3",
+        "completion": false,
+        "category": "Part Release Status",
+        "validation": "Are all PPRs and first EVAL released?",
+        "action_owner": "",
+        "due_date": "",
+        "comments": ""
+      },
+      {
+        "slno": "4",
+        "completion": false,
+        "category": "Replacement Readiness",
+        "validation": "If parent part is in production, is the replacement part (BTP) production released?",
+        "action_owner": "",
+        "due_date": "",
+        "comments": ""
+      },
+      {
+        "slno": "5",
+        "completion": false,
+        "category": "Design Analysis",
+        "validation": "PACE / DFMEA / DASH parts addressed?",
+        "action_owner": "",
+        "due_date": "",
+        "comments": ""
+      },
+      {
+        "slno": "6",
+        "completion": false,
+        "category": "V&V",
+        "validation": "Is V&V plan/halts completed (for new designs/parts only)?",
+        "action_owner": "",
+        "due_date": "",
+        "comments": ""
+      },
+      {
+        "slno": "7",
+        "completion": false,
+        "category": "Watchlist & Spares",
+        "validation": "Are new parts/designs MLO certified / parent/previous parts MLO certified?",
+        "action_owner": "",
+        "due_date": "",
+        "comments": ""
+      },
+      {
+        "slno": "8",
+        "completion": false,
+        "category": "OBS Impact",
+        "validation": "Have potential OBS/old parts been added to the watchlist?",
+        "action_owner": "",
+        "due_date": "",
+        "comments": ""
+      },
+      {
+        "slno": "9",
+        "completion": false,
+        "category": "ABS Approval",
+        "validation": "Do we have ABS approval for OBS parts (sparable) without replacement?",
+        "action_owner": "",
+        "due_date": "",
+        "comments": ""
+      },
+      {
+        "slno": "10",
+        "completion": false,
+        "category": "Config Documents",
+        "validation": "Is CR available with change matrix details for new options/reference designator updates?",
+        "action_owner": "",
+        "due_date": "",
+        "comments": ""
+      },
+      {
+        "slno": "11",
+        "completion": false,
+        "category": "Strategies Identified",
+        "validation": "Provide reason code, strategy, priority, and alignment across BUs/products.",
+        "action_owner": "",
+        "due_date": "",
+        "comments": ""
+      },
+      {
+        "slno": "12",
+        "completion": false,
+        "category": "Multi BU Alignment",
+        "validation": "If scope impacts multiple BUs/products, verify and confirm all affected BUs/products are listed.",
+        "action_owner": "",
+        "due_date": "",
+        "comments": ""
+      },
+      {
+        "slno": "13",
+        "completion": false,
+        "category": "Interchangeability & Tags",
+        "validation": "Are these complying with CRP (003-10 Interchangeability Policy)? Provide interchangeability details.",
+        "action_owner": "",
+        "due_date": "",
+        "comments": ""
+      },
+      {
+        "slno": "14",
+        "completion": false,
+        "category": "Testing & Reports",
+        "validation": "Are test results/FQR available for all IFF impacted parts/critical parts?",
+        "action_owner": "",
+        "due_date": "",
+        "comments": ""
+      },
+      {
+        "slno": "15",
+        "completion": false,
+        "category": "Cost & Savings",
+        "validation": "If the project relates to DCR (cost reduction), provide cost-saving details.",
+        "action_owner": "",
+        "due_date": "",
+        "comments": ""
+      }
+    ]
+  },
+  "obs_parts": {
+    "rows": []
+  }
+}

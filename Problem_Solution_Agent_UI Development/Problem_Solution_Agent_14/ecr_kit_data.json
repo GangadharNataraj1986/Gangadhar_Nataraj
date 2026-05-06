@@ -1,0 +1,269 @@
+{
+  "front_page": {
+    "fields": {
+      "ecr_no": "",
+      "eco_primer": "",
+      "ec_category": "",
+      "bu": "",
+      "tco": "",
+      "project_no": "",
+      "product": "",
+      "affected_modules": "",
+      "place": "",
+      "title": "",
+      "problem": "",
+      "solution": ""
+    },
+    "checklist": [
+      {
+        "slno": "1",
+        "completion": false,
+        "category": "Project Association",
+        "check_point_text": "Does the ECR include a Project (PCR)?",
+        "validation_choice": "",
+        "action_owner": "",
+        "due_date": "",
+        "comments": ""
+      },
+      {
+        "slno": "2",
+        "completion": false,
+        "category": "Safety & Compliance",
+        "check_point_text": "Provide PSER details if any safety incident occurred.\nIs a PCN required and approved by ROW and CE?",
+        "validation_choice": "",
+        "action_owner": "",
+        "due_date": "",
+        "comments": ""
+      },
+      {
+        "slno": "3",
+        "completion": false,
+        "category": "Part Release Status",
+        "check_point_text": "Are all BTPs and kits EVAL released?\nIf the parent part is in production, is the replacement part (BTP) production released?",
+        "validation_choice": "",
+        "action_owner": "",
+        "due_date": "",
+        "comments": ""
+      },
+      {
+        "slno": "4",
+        "completion": false,
+        "category": "Design Analysis",
+        "check_point_text": "Is VA/VB analysis completed (for new designs/parts only)?\nPACE / DASH parts addressed?",
+        "validation_choice": "",
+        "action_owner": "",
+        "due_date": "",
+        "comments": ""
+      },
+      {
+        "slno": "5",
+        "completion": false,
+        "category": "Watchlist & Spares",
+        "check_point_text": "Are new parts/designs MLO certified / were parent/previous parts MLO certified?\nDo we have AGS approval for OBS parts (sparable) without replacement?",
+        "validation_choice": "",
+        "action_owner": "",
+        "due_date": "",
+        "comments": ""
+      },
+      {
+        "slno": "6",
+        "completion": false,
+        "category": "Config Documents",
+        "check_point_text": "Is CCR available with change matrix details for new options/reference designator updates?",
+        "validation_choice": "",
+        "action_owner": "",
+        "due_date": "",
+        "comments": ""
+      },
+      {
+        "slno": "7",
+        "completion": false,
+        "category": "ECR Strategies Identified",
+        "check_point_text": "Provide reason code, effective strategy, priority, and disposition.",
+        "validation_choice": "",
+        "action_owner": "",
+        "due_date": "",
+        "comments": ""
+      },
+      {
+        "slno": "8",
+        "completion": false,
+        "category": "Multi BU Alignment",
+        "check_point_text": "If scope impacts multiple BUs/products, verify and confirm all affected BUs/products are listed in the project and approved.",
+        "validation_choice": "",
+        "action_owner": "",
+        "due_date": "",
+        "comments": ""
+      },
+      {
+        "slno": "9",
+        "completion": false,
+        "category": "Interchangeability & Testing",
+        "check_point_text": "Are the changes FFF compatible? Provide system details.\nAre test results/FDR available for all FFF impacted parts/critical parts?",
+        "validation_choice": "",
+        "action_owner": "",
+        "due_date": "",
+        "comments": ""
+      },
+      {
+        "slno": "10",
+        "completion": false,
+        "category": "Costs and Savings",
+        "check_point_text": "If the project relates to DCR (cost reduction), provide cost-saving details.",
+        "validation_choice": "",
+        "action_owner": "",
+        "due_date": "",
+        "comments": ""
+      }
+    ]
+  },
+  "obs_parts": {
+    "rows": [
+      {
+        "obs_part": "0042-88813",
+        "change": "Obsolete",
+        "replacement": "No Replacement"
+      },
+      {
+        "obs_part": "0011-00671",
+        "change": "Obsolete",
+        "replacement": "No Replacement"
+      },
+      {
+        "obs_part": "0042-88814",
+        "change": "Obsolete",
+        "replacement": "No Replacement"
+      },
+      {
+        "obs_part": "0011-00672",
+        "change": "Obsolete",
+        "replacement": "No Replacement"
+      },
+      {
+        "obs_part": "0241-40654",
+        "change": "Obsolete",
+        "replacement": "No Replacement"
+      },
+      {
+        "obs_part": "0241-52577",
+        "change": "Obsolete",
+        "replacement": "No Replacement"
+      },
+      {
+        "obs_part": "0011-09560",
+        "change": "Obsolete",
+        "replacement": "No Replacement"
+      },
+      {
+        "obs_part": "0042-99159",
+        "change": "Obsolete",
+        "replacement": "No Replacement"
+      },
+      {
+        "obs_part": "0241-53451",
+        "change": "Obsolete",
+        "replacement": "No Replacement"
+      },
+      {
+        "obs_part": "0011-10227",
+        "change": "Obsolete",
+        "replacement": "No Replacement"
+      },
+      {
+        "obs_part": "0043-00926",
+        "change": "Obsolete",
+        "replacement": "No Replacement"
+      },
+      {
+        "obs_part": "0023-35098",
+        "change": "Obsolete",
+        "replacement": "No Replacement"
+      },
+      {
+        "obs_part": "0241-53636",
+        "change": "Obsolete",
+        "replacement": "No Replacement"
+      },
+      {
+        "obs_part": "0241-54324",
+        "change": "Obsolete",
+        "replacement": "No Replacement"
+      },
+      {
+        "obs_part": "0241-54325",
+        "change": "Obsolete",
+        "replacement": "No Replacement"
+      },
+      {
+        "obs_part": "0241-53637",
+        "change": "Obsolete",
+        "replacement": "No Replacement"
+      },
+      {
+        "obs_part": "0241-52400",
+        "change": "Obsolete",
+        "replacement": "No Replacement"
+      },
+      {
+        "obs_part": "0241-47463",
+        "change": "Obsolete",
+        "replacement": "No Replacement"
+      },
+      {
+        "obs_part": "0042-97275",
+        "change": "Obsolete",
+        "replacement": "No Replacement"
+      },
+      {
+        "obs_part": "0241-47464",
+        "change": "Obsolete",
+        "replacement": "No Replacement"
+      },
+      {
+        "obs_part": "0241-54967",
+        "change": "Obsolete",
+        "replacement": "No Replacement"
+      },
+      {
+        "obs_part": "0043-02763",
+        "change": "Obsolete",
+        "replacement": "No Replacement"
+      },
+      {
+        "obs_part": "0241-46210",
+        "change": "Obsolete",
+        "replacement": "No Replacement"
+      },
+      {
+        "obs_part": "0241-46247",
+        "change": "Obsolete",
+        "replacement": "No Replacement"
+      },
+      {
+        "obs_part": "0241-47411",
+        "change": "Obsolete",
+        "replacement": "No Replacement"
+      },
+      {
+        "obs_part": "0241-47459",
+        "change": "Obsolete",
+        "replacement": "No Replacement"
+      },
+      {
+        "obs_part": "0241-49620",
+        "change": "Obsolete",
+        "replacement": "No Replacement"
+      },
+      {
+        "obs_part": "0241-76712",
+        "change": "Obsolete",
+        "replacement": "No Replacement"
+      },
+      {
+        "obs_part": "0241-76713",
+        "change": "Obsolete",
+        "replacement": "No Replacement"
+      }
+    ]
+  }
+}

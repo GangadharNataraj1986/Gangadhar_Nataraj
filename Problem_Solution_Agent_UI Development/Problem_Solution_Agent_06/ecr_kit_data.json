@@ -1,0 +1,113 @@
+{
+  "front_page": {
+    "fields": {
+      "ecr_no": "",
+      "eco_primer": "",
+      "ec_category": "",
+      "bu": "",
+      "tco": "",
+      "project_no": "",
+      "product": "",
+      "affected_modules": "",
+      "place": "",
+      "title": "",
+      "problem": "SCCSS",
+      "solution": ""
+    },
+    "checklist": [
+      {
+        "slno": "1",
+        "completion": false,
+        "category": "Project Association",
+        "validation_text": "Does the ECR include a Project (PCR)?",
+        "actioner_owner": "",
+        "due_date": "",
+        "comments": ""
+      },
+      {
+        "slno": "2",
+        "completion": true,
+        "category": "Safety & Compliance",
+        "validation_text": "Provide PSER details if any safety incident occurred.\nIs a PCN required and approved by ROW and CE?",
+        "actioner_owner": "",
+        "due_date": "",
+        "comments": ""
+      },
+      {
+        "slno": "3",
+        "completion": true,
+        "category": "Part Release Status",
+        "validation_text": "Are all BTPs and kits EVAL released?\nIf the parent part is in production, is the replacement part (BTP) production released?",
+        "actioner_owner": "",
+        "due_date": "",
+        "comments": ""
+      },
+      {
+        "slno": "4",
+        "completion": false,
+        "category": "Design Analysis",
+        "validation_text": "Is VA/VB analysis completed (for new designs/parts only)?\nPACE / DASH parts addressed?",
+        "actioner_owner": "",
+        "due_date": "",
+        "comments": ""
+      },
+      {
+        "slno": "5",
+        "completion": false,
+        "category": "Watchlist & Spares",
+        "validation_text": "Are new parts/designs MLO certified / were parent/previous parts MLO certified?\nDo we have AGS approval for OBS parts (sparable) without replacement?",
+        "actioner_owner": "",
+        "due_date": "",
+        "comments": ""
+      },
+      {
+        "slno": "6",
+        "completion": false,
+        "category": "Config Documents",
+        "validation_text": "Is CCR available with change matrix details for new options/reference designator updates?",
+        "actioner_owner": "",
+        "due_date": "",
+        "comments": ""
+      },
+      {
+        "slno": "7",
+        "completion": false,
+        "category": "ECR Strategies Identified",
+        "validation_text": "Provide reason code, effective strategy, priority, and disposition.",
+        "actioner_owner": "",
+        "due_date": "",
+        "comments": ""
+      },
+      {
+        "slno": "8",
+        "completion": false,
+        "category": "Multi BU Alignment",
+        "validation_text": "If scope impacts multiple BUs/products, verify and confirm all affected BUs/products are listed in the project and approved.",
+        "actioner_owner": "",
+        "due_date": "",
+        "comments": ""
+      },
+      {
+        "slno": "9",
+        "completion": false,
+        "category": "Interchangeability & Tags",
+        "validation_text": "Are the changes FFF compatible (per 03-3-10 Interchangeability Policy)? Provide system details.\nProvide interchangeability/tagging details as per CRP.",
+        "actioner_owner": "",
+        "due_date": "",
+        "comments": ""
+      },
+      {
+        "slno": "10",
+        "completion": false,
+        "category": "Testing, Reports & Cost",
+        "validation_text": "Are test results/FDR available for all IFF impacted parts/critical parts?\nIf the project relates to DCR (cost reduction), provide cost-saving details.",
+        "actioner_owner": "",
+        "due_date": "",
+        "comments": ""
+      }
+    ]
+  },
+  "obs_parts": {
+    "rows": []
+  }
+}
