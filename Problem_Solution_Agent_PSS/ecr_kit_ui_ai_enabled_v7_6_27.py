@@ -4805,11 +4805,21 @@ class InventoryCostTab(QWidget):
         self.btn_import_db.clicked.connect(self.import_databricks)
         self.btn_export.clicked.connect(self.export_excel)
         self.btn_reset.clicked.connect(self.reset_tab)
+        self.subtabs.currentChanged.connect(self._on_subtab_changed)
+
+    def _on_subtab_changed(self, idx: int):
+        if self.subtabs.tabText(idx) == 'Charts':
+            self._update_charts()
 
     def _update_charts(self):
         if not _HAS_MATPLOTLIB or self.cost_ax is None or self.demand_ax is None:
             return
+        try:
+            self._render_charts()
+        except Exception:
+            pass
 
+    def _render_charts(self):
         self.cost_ax.clear()
         self.demand_ax.clear()
 
@@ -4817,24 +4827,26 @@ class InventoryCostTab(QWidget):
             self.chart_status.setText('Import data to view charts.')
             self.cost_ax.set_title('Inventory Cost by Plant')
             self.demand_ax.set_title('Gross Demand-52 by Plant')
-            self.cost_canvas.draw_idle()
-            self.demand_canvas.draw_idle()
+            self.cost_canvas.draw()
+            self.demand_canvas.draw()
             return
 
         plants = [str(p) for p in PLANTS]
         cost_values = []
         demand_values = []
         for p in plants:
-            # Cost should be based on on-hand inventory only.
             onhand_col = f'{p} Onhand Qty'
+            onorder_col = f'{p} On Order Qty'
             std_cost_col = f'{p} Standard Cost USD'
             dem52_col = f'{p} Gross Demand-52'
 
-            onhand = pd.to_numeric(self.df.get(onhand_col, 0), errors='coerce').fillna(0)
-            std_cost = pd.to_numeric(self.df.get(std_cost_col, 0), errors='coerce').fillna(0)
-            dem52 = pd.to_numeric(self.df.get(dem52_col, 0), errors='coerce').fillna(0)
+            onhand = pd.to_numeric(self.df[onhand_col], errors='coerce').fillna(0) if onhand_col in self.df.columns else pd.Series([0.0] * len(self.df))
+            onorder = pd.to_numeric(self.df[onorder_col], errors='coerce').fillna(0) if onorder_col in self.df.columns else pd.Series([0.0] * len(self.df))
+            std_cost = pd.to_numeric(self.df[std_cost_col], errors='coerce').fillna(0) if std_cost_col in self.df.columns else pd.Series([0.0] * len(self.df))
+            dem52 = pd.to_numeric(self.df[dem52_col], errors='coerce').fillna(0) if dem52_col in self.df.columns else pd.Series([0.0] * len(self.df))
 
-            plant_cost = float((onhand * std_cost).sum())
+            # Cost = (on-hand + on-order) * standard cost
+            plant_cost = float(((onhand + onorder) * std_cost).sum())
             plant_dem52 = float(dem52.sum())
             cost_values.append(plant_cost)
             demand_values.append(plant_dem52)
@@ -4850,8 +4862,8 @@ class InventoryCostTab(QWidget):
         self.demand_ax.tick_params(axis='x', labelrotation=0)
 
         self.chart_status.setText('Charts updated for plant-wise Inventory Cost and Demand-52.')
-        self.cost_canvas.draw_idle()
-        self.demand_canvas.draw_idle()
+        self.cost_canvas.draw()
+        self.demand_canvas.draw()
 
     def _build_obs_replacement_map(self) -> Dict[str, str]:
         obs_map: Dict[str, str] = {}
@@ -4906,7 +4918,7 @@ class InventoryCostTab(QWidget):
                 d13=float(gp['Gross Demand-13'].sum()) if not gp.empty else 0
                 d26=float(gp['Gross Demand-26'].sum()) if not gp.empty else 0
                 d52=float(gp['Gross Demand-52'].sum()) if not gp.empty else 0
-                sc=float(gp['Standard Cost USD'].iloc[0]) if oh > 0 else 0
+                sc=float(gp['Standard Cost USD'].iloc[0]) if (oh > 0 or oo > 0) else 0
                 row[f'{p} On Order Qty']=oo
                 row[f'{p} Onhand Qty']=oh
                 row[f'{p} Gross Demand-13']=d13
@@ -5026,7 +5038,7 @@ class InventoryCostTab(QWidget):
                         d26 = float(plant_data.get('gross_demand_26w') or 0)
                         d52 = float(plant_data.get('gross_demand_52w') or 0)
                         raw_sc = float(plant_data.get('standard_cost_usd') or 0)
-                        sc = raw_sc if oh > 0 else 0.0
+                        sc = raw_sc if (oh > 0 or oo > 0) else 0.0
                     else:
                         oo = oh = d13 = d26 = d52 = sc = 0.0
                     row[f'{p} On Order Qty'] = oo
@@ -5114,16 +5126,16 @@ class InventoryCostTab(QWidget):
             self.table.horizontalHeader().setSectionResizeMode(c, QHeaderView.ResizeMode.Fixed)
             col_name = str(self.df.columns[c])
             if 'Cost' in col_name:
-                self.table.setColumnWidth(c, 92)
+                self.table.setColumnWidth(c, 37)  # 92 * 0.4 (-60%)
             else:
-                self.table.setColumnWidth(c, 36)
+                self.table.setColumnWidth(c, 32)  # 36 * 0.9 (-10%)
 
         # Ensure all cost columns are wide enough for currency text.
         for c, col_name in enumerate(self.df.columns):
             if 'Cost' not in str(col_name):
                 continue
             self.table.resizeColumnToContents(c)
-            self.table.setColumnWidth(c, max(self.table.columnWidth(c) + 12, 110))
+            self.table.setColumnWidth(c, max(self.table.columnWidth(c) + 5, 44))  # 110 * 0.4 (-60%)
 
         self._update_charts()
 

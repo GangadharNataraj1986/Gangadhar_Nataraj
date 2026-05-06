@@ -13,6 +13,15 @@ try:
 except ImportError:
     fetch_inventory_demand_cost = None
 
+try:
+    from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+    from matplotlib.figure import Figure
+    _HAS_MATPLOTLIB = True
+except Exception:
+    FigureCanvas = None
+    Figure = None
+    _HAS_MATPLOTLIB = False
+
 import pandas as pd
 from openpyxl import load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
@@ -4736,6 +4745,7 @@ class InventoryCostTab(QWidget):
         self.table.clear()
         self.table.setRowCount(0)
         self.table.setColumnCount(0)
+        self._update_charts()
 
     def __init__(self):
         super().__init__()
@@ -4749,14 +4759,111 @@ class InventoryCostTab(QWidget):
             h.addWidget(b)
         h.addStretch(1)
         v.addLayout(h)
+
+        self.subtabs = QTabWidget()
+
+        self.data_tab = QWidget()
+        data_layout = QVBoxLayout(self.data_tab)
+        data_layout.setContentsMargins(0, 0, 0, 0)
         self.table = QTableWidget(0,0)
         self.table.setAlternatingRowColors(True)
-        v.addWidget(self.table)
+        self.table.horizontalHeader().setVisible(True)
+        data_layout.addWidget(self.table)
+
+        self.charts_tab = QWidget()
+        charts_layout = QVBoxLayout(self.charts_tab)
+        charts_layout.setContentsMargins(8, 8, 8, 8)
+
+        self.chart_status = QLabel('Import data to view charts.')
+        charts_layout.addWidget(self.chart_status)
+
+        self.cost_canvas = None
+        self.demand_canvas = None
+        self.cost_fig = None
+        self.demand_fig = None
+        self.cost_ax = None
+        self.demand_ax = None
+
+        if _HAS_MATPLOTLIB:
+            self.cost_fig = Figure(figsize=(9, 3.8), tight_layout=True)
+            self.cost_canvas = FigureCanvas(self.cost_fig)
+            self.cost_ax = self.cost_fig.add_subplot(111)
+            charts_layout.addWidget(self.cost_canvas)
+
+            self.demand_fig = Figure(figsize=(9, 3.8), tight_layout=True)
+            self.demand_canvas = FigureCanvas(self.demand_fig)
+            self.demand_ax = self.demand_fig.add_subplot(111)
+            charts_layout.addWidget(self.demand_canvas)
+        else:
+            charts_layout.addWidget(QLabel('matplotlib is not available in this environment.'))
+
+        self.subtabs.addTab(self.data_tab, 'Table')
+        self.subtabs.addTab(self.charts_tab, 'Charts')
+        v.addWidget(self.subtabs)
         self.df = None
         self.btn_import.clicked.connect(self.import_mm360)
         self.btn_import_db.clicked.connect(self.import_databricks)
         self.btn_export.clicked.connect(self.export_excel)
         self.btn_reset.clicked.connect(self.reset_tab)
+        self.subtabs.currentChanged.connect(self._on_subtab_changed)
+
+    def _on_subtab_changed(self, idx: int):
+        if self.subtabs.tabText(idx) == 'Charts':
+            self._update_charts()
+
+    def _update_charts(self):
+        if not _HAS_MATPLOTLIB or self.cost_ax is None or self.demand_ax is None:
+            return
+        try:
+            self._render_charts()
+        except Exception:
+            pass
+
+    def _render_charts(self):
+        self.cost_ax.clear()
+        self.demand_ax.clear()
+
+        if self.df is None or self.df.empty:
+            self.chart_status.setText('Import data to view charts.')
+            self.cost_ax.set_title('Inventory Cost by Plant')
+            self.demand_ax.set_title('Gross Demand-52 by Plant')
+            self.cost_canvas.draw()
+            self.demand_canvas.draw()
+            return
+
+        plants = [str(p) for p in PLANTS]
+        cost_values = []
+        demand_values = []
+        for p in plants:
+            onhand_col = f'{p} Onhand Qty'
+            onorder_col = f'{p} On Order Qty'
+            std_cost_col = f'{p} Standard Cost USD'
+            dem52_col = f'{p} Gross Demand-52'
+
+            onhand = pd.to_numeric(self.df[onhand_col], errors='coerce').fillna(0) if onhand_col in self.df.columns else pd.Series([0.0] * len(self.df))
+            onorder = pd.to_numeric(self.df[onorder_col], errors='coerce').fillna(0) if onorder_col in self.df.columns else pd.Series([0.0] * len(self.df))
+            std_cost = pd.to_numeric(self.df[std_cost_col], errors='coerce').fillna(0) if std_cost_col in self.df.columns else pd.Series([0.0] * len(self.df))
+            dem52 = pd.to_numeric(self.df[dem52_col], errors='coerce').fillna(0) if dem52_col in self.df.columns else pd.Series([0.0] * len(self.df))
+
+            # Cost = (on-hand + on-order) * standard cost
+            plant_cost = float(((onhand + onorder) * std_cost).sum())
+            plant_dem52 = float(dem52.sum())
+            cost_values.append(plant_cost)
+            demand_values.append(plant_dem52)
+
+        self.cost_ax.bar(plants, cost_values, color='#2E86C1')
+        self.cost_ax.set_title('Inventory Cost by Plant')
+        self.cost_ax.set_ylabel('USD')
+        self.cost_ax.tick_params(axis='x', labelrotation=0)
+
+        self.demand_ax.bar(plants, demand_values, color='#27AE60')
+        self.demand_ax.set_title('Gross Demand-52 by Plant')
+        self.demand_ax.set_ylabel('Qty')
+        self.demand_ax.tick_params(axis='x', labelrotation=0)
+
+        self.chart_status.setText('Charts updated for plant-wise Inventory Cost and Demand-52.')
+        self.cost_canvas.draw()
+        self.demand_canvas.draw()
 
     def _build_obs_replacement_map(self) -> Dict[str, str]:
         obs_map: Dict[str, str] = {}
@@ -4811,7 +4918,7 @@ class InventoryCostTab(QWidget):
                 d13=float(gp['Gross Demand-13'].sum()) if not gp.empty else 0
                 d26=float(gp['Gross Demand-26'].sum()) if not gp.empty else 0
                 d52=float(gp['Gross Demand-52'].sum()) if not gp.empty else 0
-                sc=float(gp['Standard Cost USD'].iloc[0]) if (oo or oh) else 0
+                sc=float(gp['Standard Cost USD'].iloc[0]) if (oh > 0 or oo > 0) else 0
                 row[f'{p} On Order Qty']=oo
                 row[f'{p} Onhand Qty']=oh
                 row[f'{p} Gross Demand-13']=d13
@@ -4820,7 +4927,7 @@ class InventoryCostTab(QWidget):
                 row[f'{p} Standard Cost USD']=sc
                 tot_on+=oo; tot_oh+=oh
                 tot_d13+=d13; tot_d26+=d26; tot_d52+=d52
-                tot_cost+=(oo+oh)*sc
+                tot_cost+=oh*sc
             row['Total On Order Quantity']=tot_on
             row['Total Onhand']=tot_oh
             row['Gross Demand-13']=tot_d13
@@ -4930,7 +5037,8 @@ class InventoryCostTab(QWidget):
                         d13 = float(plant_data.get('gross_demand_13w') or 0)
                         d26 = float(plant_data.get('gross_demand_26w') or 0)
                         d52 = float(plant_data.get('gross_demand_52w') or 0)
-                        sc = float(plant_data.get('standard_cost_usd') or 0)
+                        raw_sc = float(plant_data.get('standard_cost_usd') or 0)
+                        sc = raw_sc if (oh > 0 or oo > 0) else 0.0
                     else:
                         oo = oh = d13 = d26 = d52 = sc = 0.0
                     row[f'{p} On Order Qty'] = oo
@@ -4944,7 +5052,7 @@ class InventoryCostTab(QWidget):
                     tot_d13 += d13
                     tot_d26 += d26
                     tot_d52 += d52
-                    tot_cost += (oo + oh) * sc
+                    tot_cost += oh * sc
                 row['Total On Order Quantity'] = tot_on
                 row['Total Onhand'] = tot_oh
                 row['Gross Demand-13'] = tot_d13
@@ -4985,16 +5093,18 @@ class InventoryCostTab(QWidget):
                 display_headers.append(name)
                 header_texts[idx] = name
 
-        # Set labels to the default header first (so model has data)
-        self.table.setHorizontalHeaderLabels(display_headers)
-        
-        # Now create and install custom rotated header
+        # Create and install custom rotated header first.
         hdr = RotatedColumnsHeader(Qt.Orientation.Horizontal, rotated_columns=rotated_cols, parent=self.table)
         hdr.set_header_texts(header_texts)  # pass cached header texts
         hdr.set_group_spans(plant_groups)
         self.table.setHorizontalHeader(hdr)
+        self.table.horizontalHeader().setVisible(True)
+
+        # Assign labels after installing the header so section/model state is fresh.
+        self.table.setHorizontalHeaderLabels(display_headers)
         
         # Force header to have access to model and update rendering
+        hdr.reset()
         hdr.viewport().update()
         self.table.horizontalHeader().setFixedHeight(180)
 
@@ -5014,7 +5124,20 @@ class InventoryCostTab(QWidget):
         self.table.resizeColumnsToContents()
         for c in rotated_cols:
             self.table.horizontalHeader().setSectionResizeMode(c, QHeaderView.ResizeMode.Fixed)
-            self.table.setColumnWidth(c, 36)
+            col_name = str(self.df.columns[c])
+            if 'Cost' in col_name:
+                self.table.setColumnWidth(c, 37)  # 92 * 0.4 (-60%)
+            else:
+                self.table.setColumnWidth(c, 32)  # 36 * 0.9 (-10%)
+
+        # Ensure all cost columns are wide enough for currency text.
+        for c, col_name in enumerate(self.df.columns):
+            if 'Cost' not in str(col_name):
+                continue
+            self.table.resizeColumnToContents(c)
+            self.table.setColumnWidth(c, max(self.table.columnWidth(c) + 5, 44))  # 110 * 0.4 (-60%)
+
+        self._update_charts()
 
     def export_excel(self):
         if self.df is None:

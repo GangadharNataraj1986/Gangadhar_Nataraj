@@ -159,6 +159,7 @@ latest_snapshot AS (
     FROM prd.pd_mm.factknxssplyconsmp
     WHERE spart IN ({part_filter})
       AND partsite IN ({plant_filter})
+      AND LOWER(COALESCE(stype, '')) IN ('quotation', 'gforecast')
     GROUP BY spart, partsite
 ),
 demand_buckets AS (
@@ -166,17 +167,17 @@ demand_buckets AS (
         f.spart AS materialnum,
         f.partsite AS plantcd,
         SUM(CASE
-                WHEN DATEDIFF(TO_DATE(f.dduedate), CURRENT_DATE()) BETWEEN 0 AND 91
+                WHEN DATEDIFF(TRY_CAST(f.dduedate AS DATE), CURRENT_DATE()) BETWEEN 0 AND 91
                     THEN COALESCE(TRY_CAST(f.dqty AS DECIMAL(38, 3)), 0)
                 ELSE 0
             END) AS gross_demand_13w,
         SUM(CASE
-                WHEN DATEDIFF(TO_DATE(f.dduedate), CURRENT_DATE()) BETWEEN 0 AND 182
+                WHEN DATEDIFF(TRY_CAST(f.dduedate AS DATE), CURRENT_DATE()) BETWEEN 0 AND 182
                     THEN COALESCE(TRY_CAST(f.dqty AS DECIMAL(38, 3)), 0)
                 ELSE 0
             END) AS gross_demand_26w,
         SUM(CASE
-                WHEN DATEDIFF(TO_DATE(f.dduedate), CURRENT_DATE()) BETWEEN 0 AND 364
+                WHEN DATEDIFF(TRY_CAST(f.dduedate AS DATE), CURRENT_DATE()) BETWEEN 0 AND 364
                     THEN COALESCE(TRY_CAST(f.dqty AS DECIMAL(38, 3)), 0)
                 ELSE 0
             END) AS gross_demand_52w
@@ -185,7 +186,7 @@ demand_buckets AS (
         ON f.spart = ls.materialnum
        AND f.partsite = ls.plantcd
        AND f.snapshotdate = ls.snapshotdate
-    WHERE COALESCE(f.stype, '') <> 'PlannedPO'
+    WHERE LOWER(COALESCE(f.stype, '')) IN ('quotation', 'gforecast')
     GROUP BY f.spart, f.partsite
 )
 SELECT
