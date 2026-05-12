@@ -6555,8 +6555,8 @@ class WURemovedBOMItemsTab(QWidget):
             tc_item = imp_table.item(r, tc_col)
             if not tc_item:
                 continue
-            comment = tc_item.text().strip().lower()
-            # Accept a list of valid comments for backward compatibility
+            comment = tc_item.text().strip()
+            # Accept a list of valid comments (case-sensitive)
             if isinstance(required_comment, list):
                 if comment not in required_comment:
                     continue
@@ -6574,10 +6574,11 @@ class WURemovedBOMItemsTab(QWidget):
                 target_parts.append(part)
 
         if not target_parts:
+            label = ', '.join(required_comment) if isinstance(required_comment, list) else required_comment
             QMessageBox.information(
                 self,
                 'No Matching Parts',
-                f'No parts found in Imp BOM where Tool comments = {required_comment.title()}.',
+                f'No parts found in Imp BOM where Tool comments = {label}.',
             )
             return
 
@@ -6602,190 +6603,189 @@ class WURemovedBOMItemsTab(QWidget):
                                 f'where_used_query.py could not be imported:\n{exc}')
             return
 
-        class _Worker(QObject):
-            finished = pyqtSignal(list)
-            error = pyqtSignal(str)
+        from PyQt6.QtWidgets import QDialog, QVBoxLayout, QPlainTextEdit, QApplication
+        from PyQt6.QtGui import QColor
+        import time as _time_ui
 
-            def __init__(self, parts, level, plant, child_only):
-                super().__init__()
-                self._parts = parts
-                self._level = level
-                self._plant = plant
-                self._child_only = child_only
-
-            def run(self):
-                try:
-                    if self._child_only:
-                        from where_used_query import fetch_where_used_level1_fast as _fwu_fast
-                        result = _fwu_fast(self._parts, self._plant)
-                    else:
-                        from where_used_query import fetch_where_used_parents_only as _fwu
-                        result = _fwu(self._parts, self._level, self._plant)
-                    self.finished.emit(result)
-                except Exception as exc:
-                    self.error.emit(str(exc))
-
-            f'at WU level {max_level} and plant {selected_plant}...',
-        # Format required_comment for display
-        if isinstance(required_comment, list):
-            comment_display = ', '.join([str(c).title() for c in required_comment])
-        else:
-            comment_display = str(required_comment).title()
-        progress = QProgressDialog(
-            f'Querying Databricks for {len(target_parts)} part(s) where Tool comments = {comment_display}\n'
-            f'at WU level {max_level} and plant {selected_plant}...',
-            None,
-            0,
-            0,
-            self,
+        _label_parts = ', '.join(required_comment) if isinstance(required_comment, list) else required_comment
+        log_dialog = QDialog(self)
+        log_dialog.setWindowTitle('WU Query — Databricks')
+        log_dialog.setMinimumWidth(620)
+        log_dialog.setMinimumHeight(300)
+        _dlg_layout = QVBoxLayout(log_dialog)
+        _dlg_header = QLabel(
+            f'Querying {len(target_parts)} part(s)  │  Tool comments = "{_label_parts}"'
+            f'  │  WU Level {max_level}  │  Plant {selected_plant}'
         )
-        progress.setMinimumDuration(0)
-        progress.setModal(True)
-        progress.show()
+        _dlg_header.setStyleSheet('font-weight:bold; padding:6px; color:#7A1C21;')
+        _dlg_layout.addWidget(_dlg_header)
+        log_text = QPlainTextEdit()
+        log_text.setReadOnly(True)
+        log_text.setMaximumBlockCount(500)
+        log_text.setStyleSheet('font-family: Consolas, monospace; font-size: 11px;')
+        _dlg_layout.addWidget(log_text)
+        log_dialog.setModal(True)
+        log_dialog.show()
+        QApplication.processEvents()
 
-        thread = QThread(self)
-        worker = _Worker(target_parts, max_level, selected_plant, False)
-        worker.moveToThread(thread)
+        _t_start = _time_ui.perf_counter()
+
+        def _log_cb(msg):
+            """Updates the log dialog immediately on the main thread."""
+            log_text.appendPlainText(msg)
+            log_text.verticalScrollBar().setValue(log_text.verticalScrollBar().maximum())
+            QApplication.processEvents()
+
+        _log_cb(
+            f'[{_time_ui.strftime("%H:%M:%S")}] Starting: {len(target_parts)} part(s)'
+            f' | WU Level {max_level} | Plant {selected_plant}'
+        )
 
         _display_headers = DISPLAY_HEADERS
         _obs_map = self._build_obs_change_map()
 
-        def _on_error(msg):
-            progress.close()
-            thread.quit()
-            QMessageBox.warning(self, 'Databricks Query Error', msg)
-
-        def _on_finished(records):
-            progress.close()
-            thread.quit()
-
-            if not records:
-                QMessageBox.information(
-                    self,
-                    'No Data',
-                    f'Databricks returned no records for {len(target_parts)} part(s) at WU level {max_level}.',
-                )
-                return
-
-            _WU_COL = 1
-            _PART_COL = 2
-            _ORPHAN_COL = 3
-            _REPL_COL = 4
-            _DATA_START = 5
-
-            wu_headers = list(_display_headers)
-            wu_headers.insert(2, 'Orphan Child')
-            all_headers = ['Select'] + wu_headers
-
-            _DB_COL_FUNCS = [
-                lambda r: r.get('rev_ln', ''),
-                lambda r: r.get('plant', ''),
-                lambda r: r.get('description', ''),
-                lambda r: r.get('item_status', ''),
-                lambda r: r.get('base_qty', ''),
-                lambda r: r.get('ext_qty', ''),
-                lambda r: r.get('uom', ''),
-                lambda r: r.get('eco_number', ''),
-                lambda r: r.get('procurement_type', ''),
-                lambda r: r.get('effectivity_date', ''),
-                lambda r: r.get('user_item_type', ''),
-                lambda r: r.get('item_seq', ''),
-                lambda r: r.get('kit_code', ''),
-                lambda r: r.get('sparable_flag', ''),
-                lambda r: r.get('designator', ''),
-                lambda r: r.get('option_class', ''),
-                lambda r: (r.get('pace_or_dash', '') if 'pace' in r.get('pace_or_dash', '').lower() else ''),
-                lambda r: r.get('mlo_class', ''),
-            ]
-
-            self.table.setUpdatesEnabled(False)
-            self.table.clear()
-            self.table.setColumnCount(len(all_headers))
-            self.table.setHorizontalHeaderLabels(all_headers)
-            self.table.setRowCount(len(records))
-
-            for row_idx, record in enumerate(records):
-                chk = QCheckBox()
-                cont = QWidget()
-                h = QHBoxLayout(cont)
-                h.setContentsMargins(0, 0, 0, 0)
-                h.setAlignment(Qt.AlignmentFlag.AlignCenter)
-                h.addWidget(chk)
-                cont._chk = chk
-                self.table.setCellWidget(row_idx, 0, cont)
-
-                wu_val = str(record.get('wu_level', ''))
-                self.table.setItem(row_idx, _WU_COL, QTableWidgetItem(wu_val))
-
-                raw_part = record.get('part', '')
-                try:
-                    level_int = int(wu_val)
-                except (ValueError, TypeError):
-                    level_int = 0
-                self.table.setItem(row_idx, _PART_COL,
-                                   QTableWidgetItem(('      ' * level_int) + raw_part))
-
-                self.table.setItem(row_idx, _ORPHAN_COL, QTableWidgetItem(''))
-
-                replacement = _obs_map.get(raw_part.strip().upper(), '')
-                rep_item = QTableWidgetItem(replacement)
-                rep_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                self.table.setItem(row_idx, _REPL_COL, rep_item)
-
-                for c_off, fn in enumerate(_DB_COL_FUNCS):
-                    self.table.setItem(row_idx, _DATA_START + c_off,
-                                       QTableWidgetItem(fn(record)))
-
-                if wu_val == '0':
-                    _blue = QColor('#C7DEFA')
-                    cont.setStyleSheet('background-color: #C7DEFA;')
-                    for _col in range(1, len(all_headers)):
-                        _item = self.table.item(row_idx, _col)
-                        if _item is not None:
-                            _item.setBackground(_blue)
-
-            self.table.setUpdatesEnabled(True)
-
-            hdr = self.table.horizontalHeader()
-            # ResizeToContents is very expensive on huge result sets.
-            if len(records) > 4000:
-                for i in range(len(all_headers)):
-                    if i == len(all_headers) - 1:
-                        hdr.setSectionResizeMode(i, QHeaderView.ResizeMode.Stretch)
-                    else:
-                        hdr.setSectionResizeMode(i, QHeaderView.ResizeMode.Interactive)
-                # Apply practical defaults for the first few key columns.
-                if len(all_headers) > 0:
-                    self.table.setColumnWidth(0, 65)   # Select
-                if len(all_headers) > 1:
-                    self.table.setColumnWidth(1, 85)   # WU Level
-                if len(all_headers) > 2:
-                    self.table.setColumnWidth(2, 260)  # Part
+        # Run synchronously on the main thread — same approach as the working
+        # "Where Used of OBS Parts" button (import_from_databricks).  The log
+        # dialog stays live because _log_cb calls processEvents() on each step.
+        try:
+            if max_level == 1:
+                from where_used_query import fetch_where_used_level1_fast as _fwu_fast
+                records = _fwu_fast(target_parts, selected_plant, log_callback=_log_cb)
             else:
-                for i in range(len(all_headers)):
-                    if i == len(all_headers) - 1:
-                        hdr.setSectionResizeMode(i, QHeaderView.ResizeMode.Stretch)
-                    else:
-                        hdr.setSectionResizeMode(i, QHeaderView.ResizeMode.ResizeToContents)
+                from where_used_query import fetch_where_used_parents_only as _fwu
+                records = _fwu(target_parts, max_level, selected_plant, log_callback=_log_cb)
+        except Exception as exc:
+            _log_cb(f'[ERROR] {exc}')
+            log_dialog.close()
+            QMessageBox.warning(self, 'Databricks Query Error', str(exc))
+            return
 
+        _elapsed = _time_ui.perf_counter() - _t_start
+        _log_cb(f'[{_time_ui.strftime("%H:%M:%S")}] Done. {len(records)} record(s) in {_elapsed:.1f}s.')
+        log_dialog.close()
+
+        if not records:
             QMessageBox.information(
-                self,
-                'Import Complete',
-                f'Imported {len(records)} row(s) from Databricks.\n'
-                f'Parts queried from Imp BOM comments {required_comment.title()}: {len(target_parts)}\n'
-                f'WU Level: {max_level} | Plant: {selected_plant}',
+                self, 'No Data',
+                f'Databricks returned no records for {len(target_parts)} part(s) at WU level {max_level}.',
             )
+            return
 
-        worker.finished.connect(_on_finished)
-        worker.error.connect(_on_error)
-        thread.started.connect(worker.run)
-        thread.start()
+        _WU_COL = 1
+        _PART_COL = 2
+        _ORPHAN_COL = 3
+        _REPL_COL = 4
+        _DATA_START = 5
+
+        wu_headers = list(_display_headers)
+        wu_headers.insert(2, 'Orphan Child')
+        all_headers = ['Select'] + wu_headers
+
+        _DB_COL_FUNCS = [
+            lambda r: r.get('rev_ln', ''),
+            lambda r: r.get('plant', ''),
+            lambda r: r.get('description', ''),
+            lambda r: r.get('item_status', ''),
+            lambda r: r.get('base_qty', ''),
+            lambda r: r.get('ext_qty', ''),
+            lambda r: r.get('uom', ''),
+            lambda r: r.get('eco_number', ''),
+            lambda r: r.get('procurement_type', ''),
+            lambda r: r.get('effectivity_date', ''),
+            lambda r: r.get('user_item_type', ''),
+            lambda r: r.get('item_seq', ''),
+            lambda r: r.get('kit_code', ''),
+            lambda r: r.get('sparable_flag', ''),
+            lambda r: r.get('designator', ''),
+            lambda r: r.get('option_class', ''),
+            lambda r: (r.get('pace_or_dash', '') if 'pace' in r.get('pace_or_dash', '').lower() else ''),
+            lambda r: r.get('mlo_class', ''),
+        ]
+
+        self.table.setUpdatesEnabled(False)
+        self.table.clear()
+        self.table.setColumnCount(len(all_headers))
+        self.table.setHorizontalHeaderLabels(all_headers)
+        self.table.setRowCount(len(records))
+
+        for row_idx, record in enumerate(records):
+            chk = QCheckBox()
+            cont = QWidget()
+            h = QHBoxLayout(cont)
+            h.setContentsMargins(0, 0, 0, 0)
+            h.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            h.addWidget(chk)
+            cont._chk = chk
+            self.table.setCellWidget(row_idx, 0, cont)
+
+            wu_val = str(record.get('wu_level', ''))
+            self.table.setItem(row_idx, _WU_COL, QTableWidgetItem(wu_val))
+
+            raw_part = record.get('part', '')
+            try:
+                level_int = int(wu_val)
+            except (ValueError, TypeError):
+                level_int = 0
+            self.table.setItem(row_idx, _PART_COL,
+                               QTableWidgetItem(('      ' * level_int) + raw_part))
+
+            self.table.setItem(row_idx, _ORPHAN_COL, QTableWidgetItem(''))
+
+            replacement = _obs_map.get(raw_part.strip().upper(), '')
+            rep_item = QTableWidgetItem(replacement)
+            rep_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.table.setItem(row_idx, _REPL_COL, rep_item)
+
+            for c_off, fn in enumerate(_DB_COL_FUNCS):
+                self.table.setItem(row_idx, _DATA_START + c_off,
+                                   QTableWidgetItem(fn(record)))
+
+            if wu_val == '0':
+                _blue = QColor('#C7DEFA')
+                cont.setStyleSheet('background-color: #C7DEFA;')
+                for _col in range(1, len(all_headers)):
+                    _item = self.table.item(row_idx, _col)
+                    if _item is not None:
+                        _item.setBackground(_blue)
+
+        self.table.setUpdatesEnabled(True)
+
+        hdr = self.table.horizontalHeader()
+        if len(records) > 4000:
+            for i in range(len(all_headers)):
+                if i == len(all_headers) - 1:
+                    hdr.setSectionResizeMode(i, QHeaderView.ResizeMode.Stretch)
+                else:
+                    hdr.setSectionResizeMode(i, QHeaderView.ResizeMode.Interactive)
+            if len(all_headers) > 0:
+                self.table.setColumnWidth(0, 65)
+            if len(all_headers) > 1:
+                self.table.setColumnWidth(1, 85)
+            if len(all_headers) > 2:
+                self.table.setColumnWidth(2, 260)
+        else:
+            for i in range(len(all_headers)):
+                if i == len(all_headers) - 1:
+                    hdr.setSectionResizeMode(i, QHeaderView.ResizeMode.Stretch)
+                else:
+                    hdr.setSectionResizeMode(i, QHeaderView.ResizeMode.ResizeToContents)
+
+        _total_elapsed = _time_ui.perf_counter() - _t_start
+        _comment_label = ', '.join(required_comment) if isinstance(required_comment, list) else required_comment
+        QMessageBox.information(
+            self,
+            'Import Complete',
+            f'Imported {len(records)} row(s) from Databricks.\n'
+            f'Parts queried (Tool comments = "{_comment_label}"): {len(target_parts)}\n'
+            f'WU Level: {max_level} | Plant: {selected_plant}\n'
+            f'Total time: {_total_elapsed:.1f}s',
+        )
 
     def import_from_databricks_for_removed_items(self):
         """Legacy flow: imports WU for rows marked as Removed BOM Item in Imp BOM."""
-        # Accept both 'removed bom item' and 'removed child part' for backward compatibility
+        # Only accept exact 'Removed BOM Item' (case-sensitive)
         self._import_wu_by_tool_comment(
-            required_comment=['removed bom item', 'removed child part'],
+            required_comment=['Removed BOM Item'],
             flow_name='Import WU of Removed BOM items',
         )
 
@@ -6836,14 +6836,14 @@ class WURemovedBOMItemsTab(QWidget):
                                 'Please import a BOM file first.')
             return
 
-        valid_comments = {'removed bom item', 'removed bom items'}
+        valid_comments = {'Removed BOM Item', 'Removed BOM Items'}
         seen = set()
         target_parts = []
         for r in range(imp_table.rowCount()):
             tc_item = imp_table.item(r, tc_col)
             if not tc_item:
                 continue
-            comment = tc_item.text().strip().lower()
+            comment = tc_item.text().strip()
             if comment not in valid_comments:
                 continue
 

@@ -367,7 +367,7 @@ def fetch_implemented_bom(
                         rec_out["bom_level"] = str(level)
                         rec_out["input_part"] = str(source.get("input_part", ""))
                         rec_out["ext_qty"] = str(ext_qty)
-                        rec_out["tool_comments"] = "Removed child Part"
+                        rec_out["tool_comments"] = "Removed BOM Item"
                         rec_out.pop("parent_part", None)
                         rec_out["__path"] = source["path"] + (child_key,)
                         # UI can apply these hints directly for orange+bold style.

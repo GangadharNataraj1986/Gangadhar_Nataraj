@@ -62,6 +62,9 @@ OUTPUT_COLUMNS: list[str] = [
     "gross_demand_13w",
     "gross_demand_26w",
     "gross_demand_52w",
+    "ags_on_hand_qty",
+    "ags_on_order_qty",
+    "ags_gross_demand_52w",
     "standard_cost_usd",
     "inventory_cost_usd",
     "supply_cost_usd",
@@ -69,14 +72,18 @@ OUTPUT_COLUMNS: list[str] = [
 
 
 def _clean_parts(parts: Iterable[str]) -> list[str]:
+    return _clean_identifiers(parts)
+
+
+def _clean_identifiers(values: Iterable[str]) -> list[str]:
     cleaned: list[str] = []
     seen: set[str] = set()
-    for raw in parts:
-        part = str(raw or "").strip().upper().replace("'", "")
-        if not part or part in seen:
+    for raw in values:
+        value = str(raw or "").strip().upper().replace("'", "")
+        if not value or value in seen:
             continue
-        seen.add(part)
-        cleaned.append(part)
+        seen.add(value)
+        cleaned.append(value)
     return cleaned
 
 
@@ -157,10 +164,8 @@ demand_buckets AS (
         plantcd,
         MAX(COALESCE(TRY_CAST(demand13wk AS DECIMAL(38, 3)), 0)) AS gross_demand_13w,
         MAX(COALESCE(TRY_CAST(demand26wk AS DECIMAL(38, 3)), 0)) AS gross_demand_26w,
-        MAX(
-            COALESCE(TRY_CAST(ssg_52_wk_dmd AS DECIMAL(38, 3)), 0)
-          + COALESCE(TRY_CAST(ags_52_wk_dmd AS DECIMAL(38, 3)), 0)
-        ) AS gross_demand_52w
+        MAX(COALESCE(TRY_CAST(ssg_52_wk_dmd AS DECIMAL(38, 3)), 0) + COALESCE(TRY_CAST(ags_52_wk_dmd AS DECIMAL(38, 3)), 0)) AS gross_demand_52w,
+        MAX(COALESCE(TRY_CAST(ags_52_wk_dmd AS DECIMAL(38, 3)), 0)) AS ags_gross_demand_52w
     FROM prd.ud_gsco.vw_active_items
     WHERE materialnum IN ({part_filter})
       AND plantcd IN ({plant_filter})
@@ -185,6 +190,9 @@ SELECT
     CAST(COALESCE(dem.gross_demand_13w, 0) AS DECIMAL(18, 3))     AS gross_demand_13w,
     CAST(COALESCE(dem.gross_demand_26w, 0) AS DECIMAL(18, 3))     AS gross_demand_26w,
     CAST(COALESCE(dem.gross_demand_52w, 0) AS DECIMAL(18, 3))     AS gross_demand_52w,
+    CAST(COALESCE(oh.on_hand_qty, 0) AS DECIMAL(18, 3))            AS ags_on_hand_qty, -- Placeholder, see note below
+    CAST(COALESCE(po.open_order_qty, 0) AS DECIMAL(18, 3))         AS ags_on_order_qty, -- Placeholder, see note below
+    CAST(COALESCE(dem.ags_gross_demand_52w, 0) AS DECIMAL(18, 3))  AS ags_gross_demand_52w,
     CAST(CASE
             WHEN (COALESCE(oh.on_hand_qty, 0) > 0 OR COALESCE(po.open_order_qty, 0) > 0)
                 THEN COALESCE(mm.stdcost_usd, 0)
@@ -252,6 +260,121 @@ def fetch_inventory_demand_cost(
     for row in rows:
         record = {columns[idx]: row[idx] for idx in range(len(columns))}
         results.append(record)
+    return results
+
+
+def fetch_open_purchase_order_details(
+    parts: Iterable[str],
+    plants: Sequence[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Return open PO detail rows for the requested part/plant combinations."""
+    cleaned_parts = _clean_parts(parts)
+    cleaned_plants = _clean_plants(plants)
+    if not cleaned_parts:
+        raise ValueError("At least one part number is required.")
+
+    try:
+        import pyodbc  # type: ignore[import]
+    except ImportError as exc:  # pragma: no cover
+        raise RuntimeError(
+            "pyodbc is not installed. Install it with: pip install pyodbc"
+        ) from exc
+
+    part_filter = ", ".join(f"'{part}'" for part in cleaned_parts)
+    plant_filter = ", ".join(f"'{plant}'" for plant in cleaned_plants)
+    sql = f"""
+SELECT
+    material_number AS part_number,
+    plant_code AS plant,
+    purchase_order_number AS po_number,
+    purchase_order_line_number AS po_line_number,
+    CAST(COALESCE(quantity, 0) - COALESCE(quantity_of_goods_received, 0) AS DECIMAL(18, 3)) AS open_qty,
+    COALESCE(vendor_name, '') AS supplier_name,
+    COALESCE(purchase_group_code, '') AS buyer_name,
+    item_delivery_date AS delivery_date
+FROM prd.ud_agsocebi.open_purchase_order
+WHERE material_number IN ({part_filter})
+  AND plant_code IN ({plant_filter})
+  AND (COALESCE(quantity, 0) - COALESCE(quantity_of_goods_received, 0)) > 0
+ORDER BY material_number, plant_code, item_delivery_date DESC, purchase_order_number DESC
+""".strip()
+
+    conn = pyodbc.connect(f"DSN={_DSN}", autocommit=True)
+    try:
+        cursor = conn.cursor()
+        cursor.execute(sql)
+        columns = [desc[0] for desc in cursor.description]
+        rows = cursor.fetchall()
+    finally:
+        conn.close()
+
+    results: list[dict[str, Any]] = []
+    for row in rows:
+        record = {columns[idx]: row[idx] for idx in range(len(columns))}
+        results.append(record)
+    return results
+
+
+def fetch_kit_code_descriptions(
+    kit_codes: Iterable[str],
+    plant: str | None = None,
+) -> dict[str, str]:
+    """Return a best-effort kit description per kit code from BOM parent descriptions."""
+    cleaned_kit_codes = _clean_identifiers(kit_codes)
+    if not cleaned_kit_codes:
+        return {}
+
+    try:
+        import pyodbc  # type: ignore[import]
+    except ImportError as exc:  # pragma: no cover
+        raise RuntimeError(
+            "pyodbc is not installed. Install it with: pip install pyodbc"
+        ) from exc
+
+    kit_filter = ", ".join(f"'{code}'" for code in cleaned_kit_codes)
+    plant_clause = ""
+    if plant:
+        cleaned_plant = str(plant).strip().replace("'", "")
+        if cleaned_plant:
+            plant_clause = f" AND b.plantcd = '{cleaned_plant}'"
+
+    sql = f"""
+WITH ranked_kit_descriptions AS (
+    SELECT
+        TRIM(b.sortstring) AS kit_code,
+        COALESCE(b.parentmaterialdesc, '') AS kit_description,
+        ROW_NUMBER() OVER (
+            PARTITION BY TRIM(b.sortstring)
+            ORDER BY
+                CASE WHEN UPPER(COALESCE(b.parentmaterialdesc, '')) LIKE '%OUTSOURCED%' THEN 0 ELSE 1 END,
+                CASE WHEN COALESCE(b.parentmaterialdesc, '') <> '' THEN 0 ELSE 1 END,
+                COALESCE(b.parentmaterialdesc, '')
+        ) AS rn
+    FROM prd.pd_mm.factbomlvl1 b
+    WHERE TRIM(b.sortstring) IN ({kit_filter})
+      AND TRIM(b.sortstring) <> ''
+      {plant_clause}
+)
+SELECT
+    kit_code,
+    kit_description
+FROM ranked_kit_descriptions
+WHERE rn = 1
+""".strip()
+
+    conn = pyodbc.connect(f"DSN={_DSN}", autocommit=True)
+    try:
+        cursor = conn.cursor()
+        cursor.execute(sql)
+        rows = cursor.fetchall()
+    finally:
+        conn.close()
+
+    results: dict[str, str] = {}
+    for kit_code, kit_description in rows:
+        key = str(kit_code or "").strip().upper()
+        if key:
+            results[key] = str(kit_description or "").strip()
     return results
 
 

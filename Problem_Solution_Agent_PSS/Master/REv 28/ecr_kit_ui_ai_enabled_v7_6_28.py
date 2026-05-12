@@ -1,3 +1,28 @@
+import threading
+import pyodbc
+def fetch_distinct_kit_codes(plant='4070'):
+    """Fetch distinct kit codes from Databricks BOM table."""
+    DSN = "Spark-PRD"
+    thread_local = threading.local()
+    def get_conn():
+        if getattr(thread_local, 'conn', None) is None:
+            thread_local.conn = pyodbc.connect(f"DSN={DSN}", autocommit=True)
+        return thread_local.conn
+    sql = f"""
+        SELECT DISTINCT sortstring AS kit_code
+        FROM prd.pd_mm.factbomlvl1
+        WHERE plantcd = '{plant}' AND sortstring IS NOT NULL AND sortstring <> ''
+        ORDER BY kit_code
+    """
+    conn = get_conn()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(sql)
+        rows = cursor.fetchall()
+        return [row[0] for row in rows if row[0]]
+    except Exception as e:
+        print(f"Error fetching kit codes: {e}")
+        return []
 # ecr_kit_ui.py (Enhanced v7.5.5 – Auto Excel conversion: silently open in Excel, SaveAs .xlsx, then import; OBS copy buttons)
 import html
 import importlib.util
@@ -9,9 +34,21 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 try:
-    from inventory_demand_cost_query import fetch_inventory_demand_cost
+    from inventory_demand_cost_query import (
+        fetch_inventory_demand_cost,
+        fetch_kit_code_descriptions,
+        fetch_open_purchase_order_details,
+    )
 except ImportError:
     fetch_inventory_demand_cost = None
+    fetch_kit_code_descriptions = None
+    fetch_open_purchase_order_details = None
+
+try:
+    from report_recommendations import REPORT_COLUMNS, build_supply_chain_report
+except ImportError:
+    REPORT_COLUMNS = []
+    build_supply_chain_report = None
 
 try:
     from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
@@ -375,6 +412,8 @@ class RotatedColumnsHeader(QHeaderView):
                 group_rect = QRect(rect.x(), rect.y(), total_w, band)
                 painter.save()
                 painter.fillRect(group_rect, QColor('#B0D8F5'))
+                painter.setPen(QPen(QColor('#1F6FB2'), 2))
+                painter.drawRect(group_rect.adjusted(0, 0, -1, -1))
                 painter.setPen(QColor('#0F2D46'))
                 bold_font = painter.font()
                 bold_font.setBold(True)
@@ -388,6 +427,8 @@ class RotatedColumnsHeader(QHeaderView):
             group_rect = QRect(rect.x(), rect.y(), total_w, band)
             painter.save()
             painter.fillRect(group_rect, QColor('#B0D8F5'))
+            painter.setPen(QPen(QColor('#1F6FB2'), 2))
+            painter.drawRect(group_rect.adjusted(0, 0, -1, -1))
             painter.setPen(QColor('#0F2D46'))
             bold_font = painter.font()
             bold_font.setBold(True)
@@ -777,33 +818,7 @@ class OBSPartsTab(QWidget):
         title_row.addWidget(delete_btn)
         outer.addLayout(title_row)
 
-        # ── Where Used of OBS Parts row ──────────────────────────────────────
-        wu_row = QHBoxLayout()
-        wu_lbl = QLabel("WU Level (1–6):")
-        wu_lbl.setStyleSheet("font-weight:600; color:#7A1C21;")
-        self.wu_level_input = QLineEdit()
-        self.wu_level_input.setFixedWidth(55)
-        self.wu_level_input.setPlaceholderText("1–6")
-        self.wu_level_input.setMaxLength(1)
-        self.wu_level_input.setToolTip("Maximum Where Used depth to retrieve (1 to 6)")
-        self.btn_where_used = QPushButton("Where Used of OBS Parts")
-        self.btn_where_used.setToolTip(
-            "Query Databricks for multi-level Where Used data for all OBS parts"
-        )
-        plant_lbl = QLabel("Plant:")
-        plant_lbl.setStyleSheet("font-weight:600; color:#7A1C21;")
-        self.plant_combo = QComboBox()
-        self.plant_combo.addItems(["4020", "4055", "4060", "4070", "4080", "4090"])
-        self.plant_combo.setCurrentText("4070")
-        self.plant_combo.setToolTip("Plant code to filter Where Used query")
-        self.plant_combo.setFixedWidth(75)
-        wu_row.addStretch(1)
-        wu_row.addWidget(wu_lbl)
-        wu_row.addWidget(self.wu_level_input)
-        wu_row.addWidget(plant_lbl)
-        wu_row.addWidget(self.plant_combo)
-        wu_row.addWidget(self.btn_where_used)
-        outer.addLayout(wu_row)
+        # (WU controls moved to Where Used tab)
 
         legend = QLabel(
             "<b>Orphan Legend:</b> "
@@ -832,7 +847,7 @@ class OBSPartsTab(QWidget):
         btn_copy_obs.clicked.connect(self.copy_obs_parts)
         btn_copy_rep.clicked.connect(self.copy_replacement_parts)
         select_all_btn.clicked.connect(self.toggle_select_all)
-        self.btn_where_used.clicked.connect(self.launch_where_used_import)
+        # (WU controls moved to Where Used tab)
         self.where_used_tab = None  # linked by MainWindow after both tabs are created
 
     def download_template(self):
@@ -1005,6 +1020,11 @@ class WhereUsedTab(QWidget):
     Data cleanup is applied to the in-app table only and source files are unchanged."""
     def __init__(self, obs_provider=None):
         super().__init__()
+        self.table = QTableWidget(0,0)
+        print('DEBUG: WhereUsedTab self.table initialized:', self.table)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setAlternatingRowColors(True)
+        self.table.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.obs_provider = obs_provider
         outer = QVBoxLayout(self)
         title_row = QHBoxLayout()
@@ -1014,25 +1034,73 @@ class WhereUsedTab(QWidget):
         title_row.addWidget(title); title_row.addStretch(1); title_row.addWidget(btn_import)
         outer.addLayout(title_row)
 
-    
+        # --- Where Used of OBS Parts controls (moved from OBS tab) ---
 
+        # --- Controls row: WU Level, Plant, Where Used of OBS Parts button, and radio selections ---
+        controls_row = QHBoxLayout()
+        wu_lbl = QLabel("WU Level (1–6):")
+        wu_lbl.setStyleSheet("font-weight:600; color:#7A1C21;")
+        self.wu_level_input = QLineEdit()
+        self.wu_level_input.setFixedWidth(55)
+        self.wu_level_input.setPlaceholderText("1–6")
+        self.wu_level_input.setMaxLength(1)
+        self.wu_level_input.setToolTip("Maximum Where Used depth to retrieve (1 to 6)")
+        plant_lbl = QLabel("Plant:")
+        plant_lbl.setStyleSheet("font-weight:600; color:#7A1C21;")
+        self.plant_combo = QComboBox()
+        self.plant_combo.addItems(["4020", "4055", "4060", "4070", "4080", "4090"])
+        self.plant_combo.setCurrentText("4070")
+        self.plant_combo.setToolTip("Plant code to filter Where Used query")
+        self.plant_combo.setFixedWidth(75)
+        controls_row.addWidget(wu_lbl)
+        controls_row.addWidget(self.wu_level_input)
+        controls_row.addWidget(plant_lbl)
+        controls_row.addWidget(self.plant_combo)
 
-        # Action buttons row
-        btn_row = QHBoxLayout()
-        self.btn_import_obs_multi = QPushButton("Import Where Used of OBS Parts (Multiple Level)")
-        self.btn_sel_9024 = QPushButton("Select all 9024 Parents")
-        self.btn_sel_options = QPushButton("Select all Options/O Class")
-        self.btn_sel_esw = QPushButton("Select ESW Parents")
-        self.btn_delete_sel = QPushButton("Delete the selected")
-        self.btn_move_to_struct = QPushButton("Move selected Items to Structure Sheet")
-        self.btn_append_obs = QPushButton("Append the selected to OBS List")
-        self.btn_export = QPushButton("Export WhereUsed")
-        self.btn_reset = QPushButton("Reset Where_Used")
-        for b in [self.btn_import_obs_multi, self.btn_sel_9024, self.btn_sel_options, self.btn_sel_esw, self.btn_delete_sel, self.btn_move_to_struct, self.btn_append_obs, self.btn_export, self.btn_reset]:
-            btn_row.addWidget(b)
-        outer.addLayout(btn_row)
+        # --- Where Used of OBS Parts button (in place of select buttons) ---
+        self.btn_where_used = QPushButton("Where Used of OBS Parts")
+        self.btn_where_used.setToolTip("Query Databricks for multi-level Where Used data for all OBS parts")
+        self.btn_where_used.setFixedWidth(180)
+        self.btn_where_used.setFixedHeight(28)
+        self.btn_where_used.setStyleSheet("font-size:12px; padding:2px 8px;")
+        self.btn_where_used.clicked.connect(self._handle_where_used_obs_parts)
+        controls_row.addSpacing(16)
+        controls_row.addWidget(self.btn_where_used)
 
-        self.table=QTableWidget(0,0); self.table.verticalHeader().setVisible(False); self.table.setAlternatingRowColors(True); self.table.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        # --- Radio selections next to Plant selection with indentation ---
+        controls_row.addSpacing(32)
+        def add_radio_group_inline(layout, label_text, group_attr, retain_attr, remove_attr):
+            label = QLabel(f"<b>{label_text}</b>")
+            label.setStyleSheet("font-size:13px; margin-right:6px;")
+            group = QButtonGroup(self)
+            retain = QRadioButton("Retain")
+            remove = QRadioButton("Remove")
+            remove.setChecked(True)
+            group.addButton(retain)
+            group.addButton(remove)
+            layout.addWidget(label)
+            layout.addWidget(retain)
+            layout.addWidget(remove)
+            setattr(self, group_attr, group)
+            setattr(self, retain_attr, retain)
+            setattr(self, remove_attr, remove)
+
+        add_radio_group_inline(controls_row, "9024 Parents:", 'radio_9024_group', 'radio_9024_retain', 'radio_9024_remove')
+        sep1 = QFrame()
+        sep1.setFrameShape(QFrame.Shape.VLine)
+        sep1.setFrameShadow(QFrame.Shadow.Sunken)
+        sep1.setLineWidth(1)
+        controls_row.addWidget(sep1)
+        add_radio_group_inline(controls_row, "ESW Parents:", 'radio_esw_group', 'radio_esw_retain', 'radio_esw_remove')
+        sep2 = QFrame()
+        sep2.setFrameShape(QFrame.Shape.VLine)
+        sep2.setFrameShadow(QFrame.Shadow.Sunken)
+        sep2.setLineWidth(1)
+        controls_row.addWidget(sep2)
+        add_radio_group_inline(controls_row, "SmBOM above Config:", 'radio_above_cfg_group', 'radio_above_cfg_retain', 'radio_above_cfg_remove')
+        controls_row.addStretch(1)
+        outer.addLayout(controls_row)
+
         outer.addWidget(self.table)
 
         self.setStyleSheet("""
@@ -1041,15 +1109,41 @@ class WhereUsedTab(QWidget):
         QTableWidget::item:selected { background:#CDE8FF; color:#0F2D46; }
         """)
         btn_import.clicked.connect(self.import_where_used)
-        self.btn_import_obs_multi.clicked.connect(self.import_where_used_of_obs_multi_level)
-        self.btn_sel_9024.clicked.connect(self.select_all_9024_parents)
-        self.btn_sel_options.clicked.connect(self.select_all_options)
-        self.btn_sel_esw.clicked.connect(self.select_esw_parents)
-        self.btn_delete_sel.clicked.connect(self.delete_selected_rows)
-        self.btn_move_to_struct.clicked.connect(self.move_selected_to_structure)
-        self.btn_append_obs.clicked.connect(self.append_selected_to_obs)
-        self.btn_export.clicked.connect(self.export_where_used)
-        self.btn_reset.clicked.connect(self.reset_where_used)
+    def _handle_where_used_obs_parts(self):
+        # Validate WU Level
+        raw_level = self.wu_level_input.text().strip()
+        if not raw_level:
+            QMessageBox.warning(self, 'WU Level Required', 'Please enter a WU Level (1 to 6) before importing.')
+            return
+        try:
+            wu_level = int(raw_level)
+            if not (1 <= wu_level <= 6):
+                raise ValueError
+        except ValueError:
+            QMessageBox.warning(self, 'Invalid WU Level', f'"{raw_level}" is not valid.  Please enter a whole number from 1 to 6.')
+            return
+        # Get OBS parts from OBS tab
+        obs_tab = getattr(self.window(), 'obs_tab', None)
+        obs_parts = []
+        if obs_tab and hasattr(obs_tab, 'table'):
+            t = obs_tab.table
+            for r in range(t.rowCount()):
+                it = t.item(r, 1)
+                val = (it.text() if it else '').strip()
+                if val:
+                    obs_parts.append(val)
+        if not obs_parts:
+            QMessageBox.warning(self, 'No OBS Parts', 'The OBS Parts column is empty. Please enter at least one part number before importing.')
+            return
+        plant = self.plant_combo.currentText().strip()
+        # Read radio button selections
+        retain_9024 = self.radio_9024_retain.isChecked()
+        retain_esw = self.radio_esw_retain.isChecked()
+        retain_above_cfg = self.radio_above_cfg_retain.isChecked()
+        # Pass these selections to import_from_databricks
+        self.import_from_databricks(obs_parts, wu_level, plant, retain_9024, retain_esw, retain_above_cfg)
+
+    # (Removed misplaced constructor-only UI wiring from this method)
 
     # ---------------- Excel conversion helpers ----------------
     def _is_html_like(self, path: str)->bool:
@@ -1374,7 +1468,35 @@ class WhereUsedTab(QWidget):
                         if qcol.isValid() and qcol.alpha() > 0:
                             rgb=f"{qcol.red():02X}{qcol.green():02X}{qcol.blue():02X}"; ws.cell(row=r+2,column=c+1).fill=PatternFill('solid', fgColor=rgb)
                     if headers[c].strip().lower()=='replacement': ws.cell(row=r+2,column=c+1).alignment=Alignment(horizontal='center')
-            wb.save(path); QMessageBox.information(self,'Export Complete', f'Exported {self.table.rowCount()} row(s) to:\n{path}')
+
+            # Add RawData sheet with formatted raw_databricks_records
+
+            try:
+                from Problem_Solution_Agent_PSS.where_used_query import DB_KEYS
+            except ImportError:
+                DB_KEYS = [
+                    "wu_level", "part", "rev_ln", "plant", "description", "item_status", "base_qty", "ext_qty", "uom", "eco_number", "procurement_type", "effectivity_date", "user_item_type", "item_seq", "kit_code", "sparable_flag", "designator", "option_class", "pace_or_dash", "mlo_class", "input_part"
+                ]
+            raw_data = getattr(self, 'raw_databricks_records', None)
+            if raw_data and isinstance(raw_data, list) and len(raw_data) > 0:
+                ws_raw = wb.create_sheet('RawData')
+                ws_raw.append(DB_KEYS)
+                for rec in raw_data:
+                    row = []
+                    for k in DB_KEYS:
+                        val = rec.get(k, '')
+                        if k == 'part':
+                            try:
+                                level = int(rec.get('wu_level', 0))
+                            except (ValueError, TypeError):
+                                level = 0
+                            val = ('      ' * level) + str(val)
+                        row.append(val)
+                    ws_raw.append(row)
+
+            wb.save(path)
+            wb.save(path)
+            QMessageBox.information(self,'Export Complete', f'Exported {self.table.rowCount()} row(s) to:\n{path}\nRawData sheet included.')
         except Exception as e:
             QMessageBox.warning(self,'Export Error', str(e))
     def reset_where_used(self):
@@ -1384,7 +1506,7 @@ class WhereUsedTab(QWidget):
         except Exception as e:
             QMessageBox.warning(self,'Reset Error', str(e))
 
-    def import_from_databricks(self, obs_parts: List[str], max_level: int, plant: str = "4070"):
+    def import_from_databricks(self, obs_parts: List[str], max_level: int, plant: str = "4070", retain_9024=False, retain_esw=False, retain_above_cfg=False):
         """Import multi-level Where Used from Databricks for the given OBS parts.
 
         Called by OBSPartsTab.launch_where_used_import() after input validation.
@@ -1421,6 +1543,7 @@ class WhereUsedTab(QWidget):
         # ── Query Databricks ───────────────────────────────────────────────────
         try:
             records = fetch_where_used(obs_parts, max_level, plant)
+            self.raw_databricks_records = records.copy() if isinstance(records, list) else None
         except Exception as exc:
             QMessageBox.warning(self, 'Databricks Query Error', str(exc))
             return
@@ -1435,6 +1558,72 @@ class WhereUsedTab(QWidget):
 
         # ── Build OBS map for Replacement column ──────────────────────────────
         obs_map = self._build_obs_map()
+
+        # --- Filter records based on radio selections ---
+        # Keep this in sync with V2 button behavior:
+        #   - 9024 remove == "Select all 9024 Parents" + delete
+        #   - ESW remove  == "Select ESW Parents" + delete
+        #   - SmBOM remove == "Select above Config" + delete
+        config_prefixes = {
+            '0490','0491','0495','0497','0430','0350','0355','0351','0357',
+            '0390','0395','0397','0335','0391','0431','0435','0437',
+            '0440','0445','0455','0450','0441','0447','0457',
+            '0460','0465','0461','0467','0410','0415','0417',
+            '0411','0412','0413','0414','0360','0365','0361','0367'
+        }
+
+        def _wu_level_int(rec: Dict[str, Any]) -> int:
+            raw = (rec.get('wu_level') if isinstance(rec, dict) else None)
+            try:
+                return int(str(raw).strip())
+            except Exception:
+                return -1
+
+        remove_idx = set()
+
+        # 9024: match _v2_select_9024_by_part (prefix + WU != 0)
+        if not retain_9024:
+            for i, rec in enumerate(records):
+                part = (rec.get('part') or '').strip()
+                if part.startswith('9024') and _wu_level_int(rec) != 0:
+                    remove_idx.add(i)
+
+        # ESW: match _v2_select_esw_by_part (prefix ESW)
+        if not retain_esw:
+            for i, rec in enumerate(records):
+                part = (rec.get('part') or '').strip().upper()
+                if part.startswith('ESW'):
+                    remove_idx.add(i)
+
+        # SmBOM above Config: match _v2_select_above_config_block semantics
+        if not retain_above_cfg:
+            n = len(records)
+            r = 0
+            while r < n:
+                lvl = _wu_level_int(records[r])
+                if lvl == 0:
+                    block_start = r
+                    block_end = n
+                    for i in range(r + 1, n):
+                        if _wu_level_int(records[i]) == 0:
+                            block_end = i
+                            break
+
+                    for i in range(block_start + 1, block_end):
+                        part_i = (records[i].get('part') or '').strip()
+                        lvl_i = _wu_level_int(records[i])
+                        if part_i[:4] in config_prefixes:
+                            for j in range(i + 1, block_end):
+                                lvl_j = _wu_level_int(records[j])
+                                if lvl_j <= lvl_i:
+                                    break
+                                remove_idx.add(j)
+                    r = block_end
+                else:
+                    r += 1
+
+        if remove_idx:
+            records = [rec for idx, rec in enumerate(records) if idx not in remove_idx]
 
         # ── Column layout ──────────────────────────────────────────────────────
         # all_headers: [Select=0, WU Level=1, Part=2, Replacement=3, Rev/Ln=4, ...]
@@ -1530,6 +1719,13 @@ class WhereUsedTab(QWidget):
             f'Imported {len(records)} row(s) from Databricks.\n'
             f'OBS parts: {len(obs_parts)}  |  Max WU level: {max_level}  |  Plant: {plant}'
         )
+        try:
+            main = self.window()
+            report_tab = getattr(main, 'report_tab', None)
+            if report_tab is not None and hasattr(report_tab, 'refresh_report'):
+                report_tab.refresh_report()
+        except Exception:
+            pass
 
 
 class WhereUsedTabV2(WhereUsedTab):
@@ -2456,18 +2652,30 @@ class WhereUsedTabV2(WhereUsedTab):
                         elif c == 1:  # Change Type column
                             bom_val = (str(row[bom_col]).strip() if (bom_col >= 0 and bom_col < len(row)) else '')
                             rep_val = (str(row[replacement_col]).strip() if (replacement_col >= 0 and replacement_col < len(row)) else '')
+                            part_val = (str(row[part_col]).lstrip(' \t') if (part_col >= 0 and part_col < len(row)) else '')
+                            is_option_part = bool(part_val) and (part_val[:4] in option_prefixes)
 
                             combo = QComboBox()
                             # BOM Level 0 rows: Revised + Change; non-zero rows: no Revised
                             if bom_val == '0':
                                 combo.addItems(change_type_options_l0)
+                                # If Option part, set default to 'Revised'
+                                if is_option_part:
+                                    idx = combo.findText('Revised')
+                                    if idx >= 0:
+                                        combo.setCurrentIndex(idx)
+                                    else:
+                                        combo.setCurrentIndex(0)
+                                else:
+                                    combo.setCurrentIndex(0)
                             else:
                                 combo.addItems(change_type_options_l1)
-
-                            combo.setCurrentIndex(0)
+                                combo.setCurrentIndex(0)
 
                             combo.setStyleSheet('QComboBox { padding: 2px; }')
-                            if hasattr(target, '_on_change_type_changed'):
+                            if hasattr(target, '_bind_change_type_combo'):
+                                target._bind_change_type_combo(combo, r)
+                            elif hasattr(target, '_on_change_type_changed'):
                                 combo.currentTextChanged.connect(lambda text, rr=r: target._on_change_type_changed(rr))
                             t.setCellWidget(r, c, combo)
                         elif c in vertical_checkbox_cols:
@@ -2862,6 +3070,7 @@ class StructureSheetTab(QWidget):
         self.table = QTableWidget(0, 0)
         self._struct_item_change_guard = False
         self._struct_action_prompt_guard = False
+        self._suppress_struct_action_prompt = False
         self._change_type_body_box = None
         self.table.verticalHeader().setVisible(False)
         self.table.setAlternatingRowColors(True)
@@ -2940,6 +3149,10 @@ class StructureSheetTab(QWidget):
                 self.table.setVisible(False)
                 self.structure_splitter.setSizes([2000, 0])
 
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._reapply_action_visibility_all_rows()
+
     def _on_build_structure_sheet_clicked(self):
         """Handler for Build Structure Sheet button: parse part numbers and fetch BOM."""
         try:
@@ -3006,7 +3219,7 @@ class StructureSheetTab(QWidget):
                 combo.addItems(change_type_options)
                 combo.setCurrentIndex(0)
                 combo.setStyleSheet('QComboBox { padding: 2px; }')
-                combo.currentTextChanged.connect(lambda text, r=row_idx: self._on_change_type_changed(r))
+                self._bind_change_type_combo(combo, row_idx)
                 self.table.setCellWidget(row_idx, c, combo)
             elif c in {2, 3, 4, 5, 6}:  # Vertical-header checkbox columns
                 cont_v = QWidget()
@@ -3053,6 +3266,201 @@ class StructureSheetTab(QWidget):
             return (combo.currentText() or '').strip()
         it = self.table.item(row_idx, 1)
         return (it.text() if it else '').strip()
+
+    def _find_row_for_action_combo(self, combo: QComboBox) -> int:
+        """Find the row index of an action combo widget in column 1."""
+        for r in range(self.table.rowCount()):
+            w = self.table.cellWidget(r, 1)
+            if w is combo:
+                return r
+        return -1
+
+    def _on_action_combo_changed(self, _text: str):
+        """Wrapper for action combo change that finds the row dynamically."""
+        combo = self.sender()
+        if not isinstance(combo, QComboBox):
+            return
+        row_idx = self._find_row_for_action_combo(combo)
+        if row_idx >= 0:
+            self._on_change_type_changed(row_idx)
+
+    def _bind_change_type_combo(self, combo: QComboBox, row_idx: int):
+        if combo is None:
+            return
+        combo.setProperty('_last_action', (combo.currentText() or '').strip())
+        combo.currentTextChanged.connect(self._on_action_combo_changed)
+
+    def _clear_row_action_changes(self, row_idx: int):
+        if row_idx < 0 or row_idx >= self.table.rowCount():
+            return
+
+        for col in {2, 3, 4, 5, 6}:
+            w = self.table.cellWidget(row_idx, col)
+            if w and hasattr(w, '_chk'):
+                w._chk.blockSignals(True)
+                w._chk.setChecked(False)
+                w._chk.blockSignals(False)
+
+        for c in range(self.table.columnCount()):
+            h = self.table.horizontalHeaderItem(c)
+            if not h:
+                continue
+            if self._selector_col_for_inserted_header(h.text()) < 0:
+                continue
+            item = self.table.item(row_idx, c)
+            if item is not None and (item.text() or ''):
+                item.setText('')
+
+        self._update_inserted_editability_for_row(row_idx)
+
+    def _row_has_changes(self, row_idx: int) -> bool:
+        """Check if a row has any actual changes (checkboxes checked or data in inserted columns)."""
+        if row_idx < 0 or row_idx >= self.table.rowCount():
+            return False
+        for col in {2, 3, 4, 5, 6}:
+            w = self.table.cellWidget(row_idx, col)
+            if w and hasattr(w, '_chk') and w._chk.isChecked():
+                return True
+        for c in range(self.table.columnCount()):
+            h = self.table.horizontalHeaderItem(c)
+            if not h:
+                continue
+            if self._selector_col_for_inserted_header(h.text()) >= 0:
+                item = self.table.item(row_idx, c)
+                if item is not None and (item.text() or '').strip():
+                    return True
+        return False
+
+    def _get_bom_level_for_row(self, row_idx: int) -> str:
+        """Get BOM level for a row."""
+        bom_col = self._find_col_by_header('BOM Level')
+        if bom_col < 0:
+            return ''
+        item = self.table.item(row_idx, bom_col)
+        return (item.text() or '').strip() if item else ''
+
+    def _is_option_part_in_row(self, row_idx: int) -> bool:
+        """Check if the part in a row is an option part."""
+        option_prefixes = {
+            '0490','0491','0495','0497','0430','0350','0355','0351','0357','0390','0395','0397','0335',
+            '0391','0431','0435','0437','0440','0445','0455','0450','0441','0447','0457','0460','0465',
+            '0461','0467','0410','0415','0417','0411','0412','0413','0414','0360','0365','0361','0367'
+        }
+        part_col = self._struct_part_col()
+        if part_col < 0:
+            return False
+        item = self.table.item(row_idx, part_col)
+        part = (item.text() if item else '').strip().lstrip(' \t')
+        return bool(part) and (part[:4] in option_prefixes)
+
+    def _row_has_kit_code_value(self, row_idx: int) -> bool:
+        """True when at least one data 'Kit Code' cell in the row has a value."""
+        def _cell_text_from_widget(widget) -> str:
+            if widget is None:
+                return ''
+            if isinstance(widget, QComboBox):
+                return (widget.currentText() or '').strip()
+            if isinstance(widget, QLineEdit):
+                return (widget.text() or '').strip()
+            if isinstance(widget, QLabel):
+                return (widget.text() or '').strip()
+            if hasattr(widget, 'toPlainText'):
+                try:
+                    return (widget.toPlainText() or '').strip()
+                except Exception:
+                    return ''
+            if hasattr(widget, 'text'):
+                try:
+                    return (widget.text() or '').strip()
+                except Exception:
+                    return ''
+            return ''
+
+        for c in range(self.table.columnCount()):
+            # Ignore selector/helper columns and check only real data columns.
+            if c in {0, 1, 2, 3, 4, 5, 6}:
+                continue
+            h = self.table.horizontalHeaderItem(c)
+            if not h or self._norm_header(h.text()) != 'kit code':
+                continue
+
+            w = self.table.cellWidget(row_idx, c)
+            if _cell_text_from_widget(w):
+                return True
+
+            item = self.table.item(row_idx, c)
+            if item and (item.text() or '').strip():
+                return True
+        return False
+
+    def _apply_action_checkbox_visibility(self, row_idx: int, action: str):
+        """Apply checkbox visibility rules based on action and BOM level."""
+        bom_level = self._get_bom_level_for_row(row_idx)
+        is_option = self._is_option_part_in_row(row_idx)
+        has_kit_code = self._row_has_kit_code_value(row_idx)
+        visible_cols = set()
+        for col in {2, 3, 4, 5, 6}:
+            w = self.table.cellWidget(row_idx, col)
+            if w and hasattr(w, '_chk'):
+                w._chk.blockSignals(True)
+                w._chk.setChecked(False)
+                w._chk.blockSignals(False)
+        if bom_level == '0':
+            if action == 'Revised':
+                visible_cols = {2, 6}
+            elif action == 'Change':
+                visible_cols = {2, 6}
+        else:
+            if action == 'Repl Item at Same Seq':
+                visible_cols = {4, 5}
+                if is_option:
+                    visible_cols.add(6)
+            elif action == 'Change':
+                # Explicitly remove 'Part Description' (col 2) for BOM Level != 0 and Action == 'Change'
+                visible_cols = {3, 4, 5}
+                if is_option:
+                    visible_cols.add(6)
+
+        # Kit Code selector rule:
+        # - If row has a Kit Code value and an action is selected, keep it visible
+        #   irrespective of BOM level.
+        # - Keep existing Remove-item exception for BOM Level != 0.
+        if action and has_kit_code and not (bom_level != '0' and action == 'Remove Item'):
+            visible_cols.add(5)
+        else:
+            visible_cols.discard(5)
+
+        for col in {2, 3, 4, 5, 6}:
+            if col in visible_cols:
+                self._ensure_selector_checkbox_widget(row_idx, col)
+            w = self.table.cellWidget(row_idx, col)
+            if w and hasattr(w, '_chk'):
+                if col in visible_cols:
+                    w._chk.setEnabled(True)
+                    w.show()
+                else:
+                    w._chk.setEnabled(False)
+                    w.hide()
+
+    def _reapply_action_visibility_all_rows(self):
+        """Reapply row action-based selector visibility (useful after tab switches)."""
+        if self.table.rowCount() <= 0:
+            return
+        for r in range(self.table.rowCount()):
+            self._apply_action_checkbox_visibility(r, self._current_change_type(r))
+            self._update_inserted_editability_for_row(r)
+
+    def _confirm_struct_action_change(self) -> bool:
+        msg = QMessageBox(self)
+        msg.setIcon(QMessageBox.Icon.Warning)
+        msg.setWindowTitle('Confirm Action Change')
+        msg.setText('If the Action is changed, all the changes made under the previously selected Action will not be saved.')
+        msg.setInformativeText('Continue or Cancel?')
+        btn_continue = msg.addButton('Continue', QMessageBox.ButtonRole.AcceptRole)
+        btn_cancel = msg.addButton('Cancel', QMessageBox.ButtonRole.RejectRole)
+        msg.setDefaultButton(btn_cancel)
+        msg.exec()
+        return msg.clickedButton() is btn_continue
 
     def _is_action_selected(self, row_idx: int) -> bool:
         return bool(self._current_change_type(row_idx))
@@ -3679,6 +4087,14 @@ class StructureSheetTab(QWidget):
             return True
         return False
 
+    def _find_row_for_action_combo(self, combo: QComboBox) -> int:
+        """Find the row index of an action combo widget in column 1."""
+        for r in range(self.table.rowCount()):
+            w = self.table.cellWidget(r, 1)
+            if w is combo:
+                return r
+        return -1
+
     def _find_row_for_selector_checkbox(self, chk: QCheckBox) -> int:
         for r in range(self.table.rowCount()):
             for c in (2, 3, 4, 5, 6):
@@ -3686,6 +4102,30 @@ class StructureSheetTab(QWidget):
                 if w and hasattr(w, '_chk') and w._chk is chk:
                     return r
         return -1
+
+    def _ensure_selector_checkbox_widget(self, row_idx: int, col_idx: int):
+        """Create selector checkbox widget if the cell currently has only a plain item."""
+        if row_idx < 0 or row_idx >= self.table.rowCount() or col_idx not in {2, 3, 4, 5, 6}:
+            return
+        existing = self.table.cellWidget(row_idx, col_idx)
+        if existing and hasattr(existing, '_chk'):
+            return
+
+        cont_v = QWidget()
+        hv = QHBoxLayout(cont_v)
+        hv.setContentsMargins(0, 0, 0, 0)
+        hv.addStretch(1)
+        chk_v = QCheckBox()
+        hv.addWidget(chk_v)
+        hv.addStretch(1)
+        cont_v._chk = chk_v
+        chk_v.stateChanged.connect(self._on_selector_checkbox_toggled)
+
+        # Set background color to match the row style
+        bg = self._default_struct_cell_bg(row_idx)
+        cont_v.setStyleSheet(f"QWidget {{ background-color: {bg.name()}; }}")
+
+        self.table.setCellWidget(row_idx, col_idx, cont_v)
 
     def _update_inserted_editability_for_row(self, row_idx: int):
         if row_idx < 0 or row_idx >= self.table.rowCount():
@@ -3751,27 +4191,29 @@ class StructureSheetTab(QWidget):
         if not combo or not isinstance(combo, QComboBox):
             return
 
-        change_type = combo.currentText()
-        show_checkboxes = bool(change_type) and (change_type not in ['Remove Item', 'Add Item'])
+        previous_action = (combo.property('_last_action') or '').strip()
+        change_type = (combo.currentText() or '').strip()
+
+        if (
+            not self._suppress_struct_action_prompt
+            and previous_action
+            and previous_action != change_type
+            and self._row_has_changes(row_idx)
+        ):
+            if not self._confirm_struct_action_change():
+                self._suppress_struct_action_prompt = True
+                try:
+                    combo.blockSignals(True)
+                    combo.setCurrentText(previous_action)
+                finally:
+                    combo.blockSignals(False)
+                    self._suppress_struct_action_prompt = False
+                return
+            self._clear_row_action_changes(row_idx)
 
         self._struct_item_change_guard = True
         try:
-            for col in {2, 3, 4, 5}:
-                w = self.table.cellWidget(row_idx, col)
-                if w and hasattr(w, '_chk'):
-                    if show_checkboxes:
-                        w.show()
-                    else:
-                        w._chk.setChecked(False)
-                        w.hide()
-
-            w_ref = self.table.cellWidget(row_idx, 6)
-            if w_ref and hasattr(w_ref, '_chk'):
-                if show_checkboxes:
-                    w_ref.show()
-                else:
-                    w_ref._chk.setChecked(False)
-                    w_ref.hide()
+            self._apply_action_checkbox_visibility(row_idx, change_type)
 
             action = self._current_change_type(row_idx)
             if action in {'Repl Item at Same Seq', 'Remove Item', 'Add Item', 'Revised', 'Change'}:
@@ -3781,6 +4223,7 @@ class StructureSheetTab(QWidget):
 
             self._update_inserted_editability_for_row(row_idx)
             self._apply_manual_added_row_style(row_idx)
+            combo.setProperty('_last_action', change_type)
         finally:
             self._struct_item_change_guard = False
 
@@ -4009,11 +4452,29 @@ class StructureSheetTab(QWidget):
                             t.setCellWidget(r, c, cont)
                         elif c == 1:
                             bom_val = (str(row[bom_col]).strip() if (bom_col >= 0 and bom_col < len(row)) else '')
+                            part_val = (str(row[part_col]).lstrip(' \t') if (part_col >= 0 and part_col < len(row)) else '')
+                            option_prefixes = {
+                                '0490','0491','0495','0497','0430','0350','0355','0351','0357','0390','0395','0397','0335',
+                                '0391','0431','0435','0437','0440','0445','0455','0450','0441','0447','0457','0460','0465',
+                                '0461','0467','0410','0415','0417','0411','0412','0413','0414','0360','0365','0361','0367'
+                            }
+                            is_option_part = bool(part_val) and (part_val[:4] in option_prefixes)
                             combo = QComboBox()
-                            combo.addItems(change_type_options_l0 if bom_val == '0' else change_type_options_l1)
-                            combo.setCurrentIndex(0)
+                            if bom_val == '0':
+                                combo.addItems(change_type_options_l0)
+                                if is_option_part:
+                                    idx = combo.findText('Revised')
+                                    if idx >= 0:
+                                        combo.setCurrentIndex(idx)
+                                    else:
+                                        combo.setCurrentIndex(0)
+                                else:
+                                    combo.setCurrentIndex(0)
+                            else:
+                                combo.addItems(change_type_options_l1)
+                                combo.setCurrentIndex(0)
                             combo.setStyleSheet('QComboBox { padding: 2px; }')
-                            combo.currentTextChanged.connect(lambda _text, rr=r: self._on_change_type_changed(rr))
+                            self._bind_change_type_combo(combo, r)
                             t.setCellWidget(r, c, combo)
                         elif c in vertical_checkbox_cols:
                             bom_here = (str(row[bom_col]).strip() if (bom_col >= 0 and bom_col < len(row)) else '')
@@ -4126,7 +4587,7 @@ class StructureSheetTab(QWidget):
                 combo.addItems(change_type_options_l0)
                 combo.setCurrentIndex(0)
                 combo.setStyleSheet('QComboBox { padding: 2px; background-color: #87CEEB; }')
-                combo.currentTextChanged.connect(lambda text, r=row_idx: self._on_change_type_changed(r))
+                self._bind_change_type_combo(combo, row_idx)
                 self.table.setCellWidget(row_idx, c, combo)
             elif c in {2, 3, 4, 5, 6}:
                 # BOM L0 rule: only Description(2) and Ref Designator(6) get checkboxes
@@ -4241,8 +4702,7 @@ class StructureSheetTab(QWidget):
                         combo.addItems(change_type_options_l1)
                         combo.setCurrentIndex(0)
                         combo.setStyleSheet('QComboBox { padding: 2px; }')
-                        combo.currentTextChanged.connect(
-                            lambda text, r=insert_at: self._on_change_type_changed(r))
+                        self._bind_change_type_combo(combo, insert_at)
                         self.table.setCellWidget(insert_at, c, combo)
                     elif c in {2, 3, 4, 5, 6}:
                         cont_v = QWidget()
@@ -4353,19 +4813,39 @@ class StructureSheetTab(QWidget):
                 h_item.setForeground(orange)
                 self.table.setHorizontalHeaderItem(insert_at, h_item)
 
-                for r in range(self.table.rowCount()):
-                    item = QTableWidgetItem('')
-                    item.setForeground(orange)
-                    item.setTextAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-                    selector_col = self.INSERTED_COL_TO_SELECTOR[new_header.lower()]
-                    selector_w = self.table.cellWidget(r, selector_col)
-                    is_checked = bool(selector_w and hasattr(selector_w, '_chk') and selector_w._chk.isChecked())
-                    self._set_item_editable(item, is_checked)
-                    if bom_col >= 0:
-                        bom_item = self.table.item(r, bom_col)
-                        if bom_item and bom_item.text().strip() == '0':
-                            item.setBackground(QColor('#87CEEB'))
-                    self.table.setItem(r, insert_at, item)
+
+                # Special handling for New Kit Code: use dropdown
+                if new_header.lower() == 'new kit code':
+                    kit_codes = fetch_distinct_kit_codes(self.cmb_build_plant.currentText() if hasattr(self, 'cmb_build_plant') else '4070')
+                    for r in range(self.table.rowCount()):
+                        combo = QComboBox()
+                        combo.addItem("")
+                        combo.addItems(kit_codes)
+                        combo.setEditable(True)
+                        combo.setStyleSheet('QComboBox { padding: 2px; }')
+                        selector_col = self.INSERTED_COL_TO_SELECTOR[new_header.lower()]
+                        selector_w = self.table.cellWidget(r, selector_col)
+                        is_checked = bool(selector_w and hasattr(selector_w, '_chk') and selector_w._chk.isChecked())
+                        combo.setEnabled(is_checked)
+                        if bom_col >= 0:
+                            bom_item = self.table.item(r, bom_col)
+                            if bom_item and bom_item.text().strip() == '0':
+                                combo.setStyleSheet('QComboBox { background-color: #87CEEB; }')
+                        self.table.setCellWidget(r, insert_at, combo)
+                else:
+                    for r in range(self.table.rowCount()):
+                        item = QTableWidgetItem('')
+                        item.setForeground(orange)
+                        item.setTextAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+                        selector_col = self.INSERTED_COL_TO_SELECTOR[new_header.lower()]
+                        selector_w = self.table.cellWidget(r, selector_col)
+                        is_checked = bool(selector_w and hasattr(selector_w, '_chk') and selector_w._chk.isChecked())
+                        self._set_item_editable(item, is_checked)
+                        if bom_col >= 0:
+                            bom_item = self.table.item(r, bom_col)
+                            if bom_item and bom_item.text().strip() == '0':
+                                item.setBackground(QColor('#87CEEB'))
+                        self.table.setItem(r, insert_at, item)
 
                 inserted += 1
 
@@ -4686,7 +5166,7 @@ class StructureSheetTab(QWidget):
                                 combo.setCurrentIndex(idx)
 
                         combo.setStyleSheet('QComboBox { padding: 2px; }')
-                        combo.currentTextChanged.connect(lambda text, rr=current_row: self._on_change_type_changed(rr))
+                        self._bind_change_type_combo(combo, current_row)
                         self.table.setCellWidget(current_row, c, combo)
                     
                     elif c in {2, 3, 4, 5, 6}:  # Checkbox columns
@@ -4747,6 +5227,8 @@ class StructureSheetTab(QWidget):
             QMessageBox.warning(self, 'Import Error', f'Error importing: {str(e)}\n{traceback.format_exc()}')
 
 
+
+
 # ================= Inventory Cost Tab (FULL UPDATED) =================
 
 PLANTS = [4020,4055,4060,4070,4080,4090]
@@ -4764,6 +5246,7 @@ class InventoryCostTab(QWidget):
         self.table.setRowCount(0)
         self.table.setColumnCount(0)
         self._update_charts()
+        self._refresh_report_tab(reset=True)
 
     def __init__(self):
         super().__init__()
@@ -4824,6 +5307,19 @@ class InventoryCostTab(QWidget):
         self.btn_export.clicked.connect(self.export_excel)
         self.btn_reset.clicked.connect(self.reset_tab)
         self.subtabs.currentChanged.connect(self._on_subtab_changed)
+
+    def _refresh_report_tab(self, reset: bool = False):
+        try:
+            main = self.window()
+            report_tab = getattr(main, 'report_tab', None)
+            if report_tab is None:
+                return
+            if reset and hasattr(report_tab, 'reset_report'):
+                report_tab.reset_report()
+            elif hasattr(report_tab, 'refresh_report'):
+                report_tab.refresh_report()
+        except Exception:
+            pass
 
     def _on_subtab_changed(self, idx: int):
         if self.subtabs.tabText(idx) == 'Charts':
@@ -4930,31 +5426,32 @@ class InventoryCostTab(QWidget):
             }
             tot_on=tot_oh=tot_d13=tot_d26=tot_d52=tot_cost=0.0
             for p in PLANTS:
-                gp=g[g['Plant Code']==p]
-                oo=float(gp['On Order Quantity'].sum()) if not gp.empty else 0
-                oh=float(gp['onhand'].sum()) if not gp.empty else 0
-                d13=float(gp['Gross Demand-13'].sum()) if not gp.empty else 0
-                d26=float(gp['Gross Demand-26'].sum()) if not gp.empty else 0
-                d52=float(gp['Gross Demand-52'].sum()) if not gp.empty else 0
-                sc=float(gp['Standard Cost USD'].iloc[0]) if (oh > 0 or oo > 0) else 0
-                row[f'{p} On Order Qty']=oo
-                row[f'{p} Onhand Qty']=oh
-                row[f'{p} Gross Demand-13']=d13
-                row[f'{p} Gross Demand-26']=d26
-                row[f'{p} Gross Demand-52']=d52
-                row[f'{p} Standard Cost USD']=sc
-                tot_on+=oo; tot_oh+=oh
-                tot_d13+=d13; tot_d26+=d26; tot_d52+=d52
-                tot_cost+=(oh + oo)*sc
-            row['Total On Order Quantity']=tot_on
-            row['Total Onhand']=tot_oh
-            row['Gross Demand-13']=tot_d13
-            row['Gross Demand-26']=tot_d26
-            row['Gross Demand-52']=tot_d52
-            row['Inventory Cost']=tot_cost
-            rows.append(row)
+                gp = g[g['Plant Code'] == p]
+                oo = float(gp['On Order Quantity'].sum()) if not gp.empty else 0
+                oh = float(gp['onhand'].sum()) if not gp.empty else 0
+                d13 = float(gp['Gross Demand-13'].sum()) if not gp.empty else 0
+                d26 = float(gp['Gross Demand-26'].sum()) if not gp.empty else 0
+                d52 = float(gp['Gross Demand-52'].sum()) if not gp.empty else 0
+                # AGS columns: if not present, set to 0
+                ags_oo = float(gp['AGS On-Order'].sum()) if 'AGS On-Order' in gp.columns and not gp.empty else 0
+                ags_oh = float(gp['AGS On-Hand'].sum()) if 'AGS On-Hand' in gp.columns and not gp.empty else 0
+                ags_d52 = float(gp['AGS 6M Gross Demand'].sum()) if 'AGS 6M Gross Demand' in gp.columns and not gp.empty else 0
+                sc = float(gp['Standard Cost USD'].iloc[0]) if (oh > 0 or oo > 0) else 0
+                row[f'{p} On Order Qty'] = oo
+                row[f'{p} Onhand Qty'] = oh
+                row[f'{p} Gross Demand-13'] = d13
+                row[f'{p} Gross Demand-26'] = d26
+                row[f'{p} Gross Demand-52'] = d52
+                row[f'{p} AGS On-Order'] = ags_oo
+                row[f'{p} AGS On-Hand'] = ags_oh
+                row[f'{p} AGS 6M Gross Demand'] = ags_d52
+                row[f'{p} Standard Cost USD'] = sc
+                tot_on += oo; tot_oh += oh
+                tot_d13 += d13; tot_d26 += d26; tot_d52 += d52
+                tot_cost += (oh + oo) * sc
         self.df=pd.DataFrame(rows).sort_values('Inventory Cost',ascending=False)
         self.render()
+        self._refresh_report_tab()
 
     def import_databricks(self):
         """Import inventory, demand, and cost data from Databricks for OBS parts."""
@@ -5055,22 +5552,30 @@ class InventoryCostTab(QWidget):
                         d13 = float(plant_data.get('gross_demand_13w') or 0)
                         d26 = float(plant_data.get('gross_demand_26w') or 0)
                         d52 = float(plant_data.get('gross_demand_52w') or 0)
+                        ags_oo = float(plant_data.get('ags_on_order_qty') or 0)
+                        ags_oh = float(plant_data.get('ags_on_hand_qty') or 0)
+                        ags_d52 = float(plant_data.get('ags_gross_demand_52w') or 0)
                         raw_sc = float(plant_data.get('standard_cost_usd') or 0)
                         sc = raw_sc if (oh > 0 or oo > 0) else 0.0
                     else:
-                        oo = oh = d13 = d26 = d52 = sc = 0.0
+                        oo = oh = d13 = d26 = d52 = ags_oo = ags_oh = ags_d52 = sc = 0.0
                     row[f'{p} On Order Qty'] = oo
                     row[f'{p} Onhand Qty'] = oh
                     row[f'{p} Gross Demand-13'] = d13
                     row[f'{p} Gross Demand-26'] = d26
                     row[f'{p} Gross Demand-52'] = d52
+                    row[f'{p} AGS On-Order'] = ags_oo
+                    row[f'{p} AGS On-Hand'] = ags_oh
+                    row[f'{p} AGS 6M Gross Demand'] = ags_d52
                     row[f'{p} Standard Cost USD'] = sc
-                    tot_on += oo
-                    tot_oh += oh
-                    tot_d13 += d13
-                    tot_d26 += d26
-                    tot_d52 += d52
-                    tot_cost += (oh + oo) * sc
+                    # Only sum non-AGS columns for totals
+                    if not ("AGS" in f'{p} On Order Qty' or "AGS" in f'{p} Onhand Qty' or "AGS" in f'{p} Gross Demand-13' or "AGS" in f'{p} Gross Demand-26' or "AGS" in f'{p} Gross Demand-52'):
+                        tot_on += oo
+                        tot_oh += oh
+                        tot_d13 += d13
+                        tot_d26 += d26
+                        tot_d52 += d52
+                        tot_cost += (oh + oo) * sc
                 row['Total On Order Quantity'] = tot_on
                 row['Total Onhand'] = tot_oh
                 row['Gross Demand-13'] = tot_d13
@@ -5079,24 +5584,15 @@ class InventoryCostTab(QWidget):
                 row['Inventory Cost'] = tot_cost
                 rows.append(row)
             self.df = pd.DataFrame(rows).sort_values('Inventory Cost', ascending=False)
-            QMessageBox.information(self, 'Success', f'Loaded {len(rows)} OBS part(s) from Databricks.')
             self.render()
+            self._refresh_report_tab()
+            QMessageBox.information(self, 'Success', f'Loaded {len(rows)} OBS part(s) from Databricks.')
         except Exception as e:
             QMessageBox.warning(self, 'Import Error', f'Error importing from Databricks: {str(e)}')
 
     def render(self):
         if self.df is None: return
-        self.table.setRowCount(len(self.df))
-        self.table.setColumnCount(len(self.df.columns))
-
         headers = self.df.columns.tolist()
-        display_headers = []
-        rotated_cols = []
-        plant_groups = []
-        header_texts = {}  # { col_index: text }
-        
-
-        # --- Patch: Group summary columns under 'Total' and rotate them ---
         summary_cols = [
             "Total On Order Quantity",
             "Total Onhand",
@@ -5105,26 +5601,81 @@ class InventoryCostTab(QWidget):
             "Gross Demand-52",
             "Inventory Cost"
         ]
+        plant_non_ags_cols = []
+        ags_cols = []
+        base_cols = []
+
+        # Show AGS columns only for plants where AGS inventory exists.
+        ags_visible_plants = set()
+        for h in headers:
+            m = re.match(r'^(\d{4})\s+AGS (On-Order|On-Hand)$', str(h))
+            if not m:
+                continue
+            plant = m.group(1)
+            series = pd.to_numeric(self.df[h], errors='coerce').fillna(0)
+            if series.ne(0).any():
+                ags_visible_plants.add(plant)
+
+        for h in headers:
+            m = re.match(r'^(\d{4})\s+(.+)$', str(h))
+            if m:
+                plant = m.group(1)
+                metric = m.group(2)
+                if metric.startswith("AGS"):
+                    if plant in ags_visible_plants:
+                        ags_cols.append(h)
+                else:
+                    plant_non_ags_cols.append(h)
+            elif str(h).strip() not in summary_cols:
+                base_cols.append(h)
+        total_cols = [c for c in summary_cols if c in headers]
+        ordered_headers = base_cols + plant_non_ags_cols + ags_cols + total_cols
+        # Only keep the explicitly ordered columns — no leftover columns after Total.
+        view_df = self.df.loc[:, ordered_headers]
+
+        self.table.setRowCount(len(view_df))
+        self.table.setColumnCount(len(view_df.columns))
+
+        headers = view_df.columns.tolist()
+        display_headers = []
+        rotated_cols = []
+        plant_groups = []
+        header_texts = {}  # { col_index: text }
+
+        # Group plant columns, AGS columns, and Total columns for rotated header.
         summary_indices = []
+        ags_indices = []
+        plant_groups = []
         for idx, name in enumerate(headers):
             m = re.match(r'^(\d{4})\s+(.+)$', str(name))
             if m:
                 plant = m.group(1)
                 metric = m.group(2)
-                display_headers.append(metric)
-                header_texts[idx] = metric
+                display_label = f"{metric} ({plant})"
+                display_headers.append(display_label)
+                header_texts[idx] = display_label
                 rotated_cols.append(idx)
-                if not plant_groups or plant_groups[-1][0] != plant:
-                    plant_groups.append((plant, [idx]))
+                if metric.startswith("AGS"):
+                    ags_indices.append(idx)
                 else:
-                    plant_groups[-1][1].append(idx)
+                    if not plant_groups or plant_groups[-1][0] != plant:
+                        plant_groups.append((plant, [idx]))
+                    else:
+                        plant_groups[-1][1].append(idx)
             else:
                 display_headers.append(name)
                 header_texts[idx] = name
                 if name.strip() in summary_cols:
                     summary_indices.append(idx)
+        # Remove AGS columns from plant groups if present
+        for i, (gname, idxs) in enumerate(plant_groups):
+            plant_groups[i] = (gname, [ix for ix in idxs if ix not in ags_indices])
+        plant_groups = [(g, idxs) for g, idxs in plant_groups if idxs]
         # Ensure summary columns are rotated
         rotated_cols.extend(i for i in summary_indices if i not in rotated_cols)
+        # Insert AGS group before Total group
+        if ags_indices:
+            plant_groups.append(("AGS", ags_indices))
         # Add a 'Total' group for summary columns
         if summary_indices:
             plant_groups.append(("Total", summary_indices))
@@ -5160,47 +5711,100 @@ class InventoryCostTab(QWidget):
         hdr.viewport().update()
         self.table.horizontalHeader().setFixedHeight(180)
 
+        # Build per-column group index for background coloring.
+        col_to_group_idx = {}  # col_index -> group_palette_index
+        for gi, (gname, idxs) in enumerate(plant_groups):
+            for ci in idxs:
+                col_to_group_idx[ci] = gi
+        GROUP_COLORS = [
+            QColor('#D6EAF8'), QColor('#D5F5E3'), QColor('#FDEBD0'),
+            QColor('#E8DAEF'), QColor('#D6EAF8'), QColor('#D5F5E3'),
+            QColor('#FDEBD0'), QColor('#E8DAEF'),
+        ]
+        AGS_COLOR = QColor('#BDE3F7')
+        TOTAL_COLOR = QColor('#D9E1F2')
+
         # Populate table data
-        for r in range(len(self.df)):
-            for c, col in enumerate(self.df.columns):
-                v = self.df.iloc[r][col]
-                txt = str(v)
-                # Blank summary demand columns if both total on order and onhand are blank/zero
-                if col in ("Gross Demand-13", "Gross Demand-26", "Gross Demand-52"):
-                    tot_onorder = self.df.iloc[r].get("Total On Order Quantity", None)
-                    tot_onhand = self.df.iloc[r].get("Total Onhand", None)
-                    if (tot_onorder in [0, '', None] or pd.isna(tot_onorder)) and (tot_onhand in [0, '', None] or pd.isna(tot_onhand)):
+        row_series_cache = {}
+        for r in range(len(view_df)):
+            row_data = view_df.iloc[r]
+            for c, col in enumerate(view_df.columns):
+                v = row_data[col]
+                # Determine numeric value safely.
+                try:
+                    num_v = float(v)
+                except (TypeError, ValueError):
+                    num_v = None
+
+                # --- Resolve display text ---
+                txt = str(v) if (num_v is None or num_v != 0) else ''
+
+                # AGS 6M Gross Demand: blank if AGS On-Order and On-Hand are both 0.
+                if 'AGS 6M Gross Demand' in str(col):
+                    ma = re.match(r'^(\d{4})\s+AGS 6M Gross Demand$', str(col))
+                    plant = ma.group(1) if ma else ''
+                    try:
+                        ags_oh = float(row_data.get(f'{plant} AGS On-Hand', 0) or 0)
+                    except (TypeError, ValueError):
+                        ags_oh = 0
+                    try:
+                        ags_oo = float(row_data.get(f'{plant} AGS On-Order', 0) or 0)
+                    except (TypeError, ValueError):
+                        ags_oo = 0
+                    txt = '' if (ags_oh == 0 and ags_oo == 0) else (str(v) if (num_v is None or num_v != 0) else '0')
+
+                # Total-group summary demand: blank if no total inventory.
+                elif col in ('Gross Demand-13', 'Gross Demand-26', 'Gross Demand-52'):
+                    try:
+                        tot_oo = float(row_data.get('Total On Order Quantity', 0) or 0)
+                        tot_oh = float(row_data.get('Total Onhand', 0) or 0)
+                    except (TypeError, ValueError):
+                        tot_oo = tot_oh = 0
+                    if tot_oo == 0 and tot_oh == 0:
                         txt = ''
-                    elif isinstance(v, (int, float)) and v == 0:
+                    elif num_v == 0:
                         txt = '0'
-                elif isinstance(v, (int, float)) and v == 0:
-                    # For demand columns, blank if both On Hand and On Order are zero for this plant
-                    if 'Gross Demand' in str(col):
-                        m = re.match(r'^(\d{4}) Gross Demand-(\d+)', str(col))
-                        if m:
-                            plant = m.group(1)
-                            onhand_col = f'{plant} Onhand Qty'
-                            onorder_col = f'{plant} On Order Qty'
-                            onhand = self.df.iloc[r][onhand_col] if onhand_col in self.df.columns else 0
-                            onorder = self.df.iloc[r][onorder_col] if onorder_col in self.df.columns else 0
-                            if (onhand == 0 or pd.isna(onhand)) and (onorder == 0 or pd.isna(onorder)):
-                                txt = ''
-                            else:
-                                txt = '0'
-                        else:
+
+                # Per-plant Gross Demand: blank if plant has no inventory.
+                elif 'Gross Demand' in str(col) and re.match(r'^\d{4} Gross Demand-', str(col)):
+                    mp = re.match(r'^(\d{4}) Gross Demand-', str(col))
+                    if mp:
+                        plant = mp.group(1)
+                        try:
+                            oh = float(row_data.get(f'{plant} Onhand Qty', 0) or 0)
+                            oo = float(row_data.get(f'{plant} On Order Qty', 0) or 0)
+                        except (TypeError, ValueError):
+                            oh = oo = 0
+                        if oh == 0 and oo == 0:
+                            txt = ''
+                        elif num_v == 0:
                             txt = '0'
+
+                # Cost formatting.
+                elif num_v is not None and 'Cost' in str(col) and num_v != 0:
+                    txt = f'${num_v:,.2f}'
+
+                item = QTableWidgetItem(txt)
+
+                # --- Background coloring per group ---
+                if c in col_to_group_idx:
+                    gi = col_to_group_idx[c]
+                    gname = plant_groups[gi][0]
+                    if gname == 'AGS':
+                        item.setBackground(QBrush(AGS_COLOR))
+                    elif gname == 'Total':
+                        item.setBackground(QBrush(TOTAL_COLOR))
                     else:
-                        txt = ''
-                elif isinstance(v, (int, float)) and 'Cost' in col:
-                    txt = f'${v:,.2f}'
-                self.table.setItem(r, c, QTableWidgetItem(txt))
+                        item.setBackground(QBrush(GROUP_COLORS[gi % len(GROUP_COLORS)]))
+
+                self.table.setItem(r, c, item)
 
 
         # Resize and apply fixed widths to rotated columns
         self.table.resizeColumnsToContents()
         for c in rotated_cols:
             self.table.horizontalHeader().setSectionResizeMode(c, QHeaderView.ResizeMode.Fixed)
-            col_name = str(self.df.columns[c])
+            col_name = str(view_df.columns[c])
             if col_name.strip() in ("Total Gross Demand-13", "Total Gross Demand-26", "Total Gross Demand-52"):
                 self.table.setColumnWidth(c, 36)
             elif col_name.strip() == "Inventory Cost":
@@ -5214,8 +5818,14 @@ class InventoryCostTab(QWidget):
 
         # Reduce width and wrap text for 'Total On Order Quantity' header
         try:
-            idx = self.df.columns.get_loc('Total On Order Quantity')
-            self.table.setColumnWidth(idx, 70)
+            idx = view_df.columns.get_loc('Total On Order Quantity')
+            # Match width to 'Total Onhand' column if present, else use 44
+            try:
+                idx_onhand = view_df.columns.get_loc('Total Onhand')
+                width = self.table.columnWidth(idx_onhand)
+            except Exception:
+                width = 44
+            self.table.setColumnWidth(idx, width)
             item = self.table.horizontalHeaderItem(idx)
             if item:
                 item.setText('Total\nOn Order\nQuantity')
@@ -5223,7 +5833,7 @@ class InventoryCostTab(QWidget):
             pass
 
         # Ensure only non-rotated cost columns are widened for readability.
-        for c, col_name in enumerate(self.df.columns):
+        for c, col_name in enumerate(view_df.columns):
             if 'Cost' not in str(col_name):
                 continue
             if c in rotated_cols:
@@ -5247,6 +5857,50 @@ class InventoryCostTab(QWidget):
         import pandas as pd
 
         df = self.df.copy()
+        summary_headers = [
+            "Total On Order Quantity",
+            "Total Onhand",
+            "Gross Demand-13",
+            "Gross Demand-26",
+            "Gross Demand-52",
+            "Inventory Cost"
+        ]
+
+        # Reorder export columns: base -> plant(non-AGS) -> AGS -> Total
+        export_headers = df.columns.tolist()
+        export_plant_non_ags = []
+        export_ags = []
+        export_base = []
+        for h in export_headers:
+            m = re.match(r'^(\d{4})\s+(.+)$', str(h))
+            if m:
+                metric = m.group(2)
+                if metric.startswith("AGS"):
+                    export_ags.append(h)
+                else:
+                    export_plant_non_ags.append(h)
+            elif str(h).strip() not in summary_headers:
+                export_base.append(h)
+        export_total = [c for c in summary_headers if c in export_headers]
+        ordered_export_headers = export_base + export_plant_non_ags + export_ags + export_total
+        ordered_export_set = set(ordered_export_headers)
+        ordered_export_headers.extend([h for h in export_headers if h not in ordered_export_set])
+        df = df.loc[:, ordered_export_headers]
+
+        # Blank AGS demand when AGS inventory is zero.
+        for col in list(df.columns):
+            m = re.match(r'^(\d{4})\s+AGS 6M Gross Demand$', str(col))
+            if not m:
+                continue
+            plant = m.group(1)
+            oh_col = f"{plant} AGS On-Hand"
+            oo_col = f"{plant} AGS On-Order"
+            if oh_col in df.columns and oo_col in df.columns:
+                mask = (
+                    pd.to_numeric(df[oh_col], errors='coerce').fillna(0).eq(0)
+                    & pd.to_numeric(df[oo_col], errors='coerce').fillna(0).eq(0)
+                )
+                df.loc[mask, col] = ''
         if 'Replacement Part' not in df.columns:
             obs_map = self._build_obs_replacement_map()
             df.insert(2, 'Replacement Part', '')
@@ -5279,21 +5933,19 @@ class InventoryCostTab(QWidget):
         # ---- Group plant metric columns in row 1 using plant code ----
         groups = {}
         total_group_cols = []
-        summary_headers = [
-            "Total On Order Quantity",
-            "Total Onhand",
-            "Gross Demand-13",
-            "Gross Demand-26",
-            "Gross Demand-52",
-            "Inventory Cost"
-        ]
+        ags_group_cols = []
         for c in range(1, ws.max_column + 1):
             val = str(ws.cell(2, c).value or '')
             m = re.match(r'^(\d{4})\s+', val)
             if m:
                 code = m.group(1)
-                ws.cell(1, c).value = code
-                groups.setdefault(code, []).append(c)
+                metric = val.split(' ', 1)[1] if ' ' in val else ''
+                if metric.startswith('AGS'):
+                    ws.cell(1, c).value = 'AGS'
+                    ags_group_cols.append(c)
+                else:
+                    ws.cell(1, c).value = code
+                    groups.setdefault(code, []).append(c)
             elif val.strip() in summary_headers:
                 total_group_cols.append(c)
 
@@ -5304,6 +5956,14 @@ class InventoryCostTab(QWidget):
             if len(cols) > 1:
                 ws.merge_cells(start_row=1, start_column=cols[0], end_row=1, end_column=cols[-1])
             cell = ws.cell(1, cols[0])
+            cell.alignment = Alignment(horizontal='center', vertical='center')
+            cell.font = Font(bold=True)
+
+        # Merge summary columns under 'Total' in row 1
+        if ags_group_cols:
+            ws.merge_cells(start_row=1, start_column=ags_group_cols[0], end_row=1, end_column=ags_group_cols[-1])
+            cell = ws.cell(1, ags_group_cols[0])
+            cell.value = 'AGS'
             cell.alignment = Alignment(horizontal='center', vertical='center')
             cell.font = Font(bold=True)
 
@@ -5361,6 +6021,232 @@ class InventoryCostTab(QWidget):
 
         wb.save(path)
         QMessageBox.information(self, 'Export', 'Excel exported successfully')
+
+
+class ReportTab(QWidget):
+    def __init__(self):
+        super().__init__()
+        outer = QVBoxLayout(self)
+
+        actions = QHBoxLayout()
+        self.btn_refresh = QPushButton('Refresh Report')
+        self.btn_reset = QPushButton('Reset Report')
+        self.status_label = QLabel('Generate Inventory_Cost data to prepare the report.')
+        self.status_label.setWordWrap(True)
+        actions.addWidget(self.btn_refresh)
+        actions.addWidget(self.btn_reset)
+        actions.addWidget(self.status_label, 1)
+        outer.addLayout(actions)
+
+        self.report_text = QTextEdit()
+        self.report_text.setReadOnly(True)
+        self.report_text.setPlaceholderText('Generate Inventory_Cost data to prepare the report narrative.')
+        outer.addWidget(self.report_text)
+
+        self.df = pd.DataFrame(columns=REPORT_COLUMNS)
+        self.btn_refresh.clicked.connect(lambda: self.refresh_report(show_messages=True))
+        self.btn_reset.clicked.connect(self.reset_report)
+
+    def reset_report(self):
+        self.df = pd.DataFrame(columns=REPORT_COLUMNS)
+        self.report_text.clear()
+        self.status_label.setText('Generate Inventory_Cost data to prepare the report.')
+
+    def refresh_report(self, show_messages: bool = False):
+        if build_supply_chain_report is None:
+            msg = 'Report helper module is unavailable.'
+            self.status_label.setText(msg)
+            if show_messages:
+                QMessageBox.warning(self, 'Report', msg)
+            return
+
+        main = self.window()
+        inventory_tab = getattr(main, 'inventory_cost_tab', None)
+        inventory_df = getattr(inventory_tab, 'df', None)
+        if inventory_df is None or inventory_df.empty:
+            self.reset_report()
+            return
+
+        obs_parts = [
+            str(value).strip().upper()
+            for value in inventory_df.get('Material Number', pd.Series(dtype=str)).tolist()
+            if str(value).strip()
+        ]
+        whereused_tab = getattr(main, 'whereused_tab', None)
+        where_used_records = getattr(whereused_tab, 'raw_databricks_records', None) or []
+        warnings = []
+
+        po_details = []
+        if fetch_open_purchase_order_details is not None:
+            try:
+                po_details = fetch_open_purchase_order_details(obs_parts, plants=PLANTS)
+            except Exception as exc:
+                warnings.append(f'PO details unavailable: {exc}')
+        else:
+            warnings.append('PO details unavailable.')
+
+        kit_descriptions = {}
+        kit_codes = sorted(
+            {
+                str(record.get('kit_code', '')).strip().upper()
+                for record in where_used_records
+                if str(record.get('kit_code', '')).strip()
+            }
+        )
+        if kit_codes and fetch_kit_code_descriptions is not None:
+            try:
+                where_used_plant = next(
+                    (
+                        str(record.get('plant', '')).strip()
+                        for record in where_used_records
+                        if str(record.get('plant', '')).strip()
+                    ),
+                    '',
+                )
+                kit_descriptions = fetch_kit_code_descriptions(kit_codes, plant=where_used_plant or None)
+            except Exception as exc:
+                warnings.append(f'Kit descriptions unavailable: {exc}')
+        elif not where_used_records:
+            warnings.append('Where Used data not loaded; outsourced recommendations may be incomplete.')
+
+        try:
+            self.df = build_supply_chain_report(
+                inventory_df=inventory_df,
+                where_used_records=where_used_records,
+                po_details=po_details,
+                kit_descriptions=kit_descriptions,
+                plants=PLANTS,
+            )
+        except Exception as exc:
+            self.status_label.setText(f'Report generation failed: {exc}')
+            if show_messages:
+                QMessageBox.warning(self, 'Report', f'Failed to build report:\n{exc}')
+            return
+
+        self.render()
+        if self.df.empty:
+            status_text = 'No actionable report rows were generated from the current Inventory_Cost data.'
+        else:
+            action_count = self.df['Recommended Action'].nunique() if 'Recommended Action' in self.df.columns else 0
+            status_text = f'Generated {len(self.df)} report row(s) across {action_count} action type(s).'
+        if warnings:
+            status_text = status_text + ' ' + ' '.join(warnings)
+        self.status_label.setText(status_text)
+        if show_messages and warnings:
+            QMessageBox.information(self, 'Report', status_text)
+
+    def render(self):
+        if self.df is None or self.df.empty:
+            self.report_text.setPlainText('No actionable recommendations are available for the current selection.')
+            return
+
+        lines: list[str] = []
+        # Group by Part only, ignore Plant
+        grouped = self.df.sort_values(['Part', 'Recommended Action']).groupby('Part', dropna=False)
+        for part, group in grouped:
+            part = str(part or '').strip()
+            if not part:
+                continue
+            # Get summary values from the first row (all rows for this part have same totals)
+            first_row = group.iloc[0]
+            total_inv = self._fmt_num(first_row.get('Total Inventory', ''))
+            total_demand = self._fmt_num(first_row.get('Total Demand', ''))
+            total_excess = self._fmt_num(first_row.get('Excess Quantity', ''))
+            lines.append(f"{part} / {total_inv} - {total_demand} = {total_excess}")
+
+            # Prepare recommendations for this part
+            rec_lines = []
+            rec_idx = 1
+            for _, row in group.iterrows():
+                action = str(row.get('Recommended Action', '') or '').strip()
+                if action == 'Cancel PO':
+                    po_number = str(row.get('PO Number', '') or '').strip()
+                    supplier = str(row.get('Supplier Name', '') or '').strip()
+                    qty = self._fmt_num(row.get('PO Qty', ''))
+                    delivery = self._fmt_delivery(row.get('Delivery Date', ''))
+                    rec_lines.append(f"Recommendation {rec_idx}: {po_number} / {supplier} / {qty} / {delivery} - Map the Excess Qty, with with PO Cancelation")
+                    rec_idx += 1
+                elif action == 'Sell back to CM':
+                    total_excess = self._fmt_num(row.get('Excess Quantity', ''))
+                    kit_code = str(row.get('Kit Code', '') or '').strip()
+                    rec_lines.append(f"Recommendation {rec_idx}: {total_excess} -> Sell Back Opportunity({kit_code})")
+                    rec_idx += 1
+            if not rec_lines:
+                # If no recognized recommendations, add a generic one
+                rec_lines.append("No actionable recommendation for this part.")
+            lines.extend(rec_lines)
+            lines.append("")  # Blank line between parts
+
+        self.report_text.setPlainText('\n'.join(line for line in lines).strip())
+
+    def _sentence_from_row(self, row: pd.Series, include_supplier: bool = True) -> str:
+        part = str(row.get('Part', '') or '').strip()
+        plant = str(row.get('Plant', '') or '').strip()
+        action = str(row.get('Recommended Action', '') or '').strip()
+        excess = self._fmt_num(row.get('Excess Quantity', ''))
+        po_number = str(row.get('PO Number', '') or '').strip()
+        po_qty = self._fmt_num(row.get('PO Qty', ''))
+        supplier = str(row.get('Supplier Name', '') or '').strip()
+        delivery = self._fmt_delivery(row.get('Delivery Date', ''))
+        destination = str(row.get('Destination Plant', '') or '').strip()
+        transfer_qty = self._fmt_num(row.get('Transfer Quantity', ''))
+        kit_code = str(row.get('Kit Code', '') or '').strip()
+        kit_desc = str(row.get('Kit Description', '') or '').strip()
+
+        supplier_text = f' Supplier {supplier}.' if (include_supplier and supplier) else ''
+        if action == 'Cancel PO':
+            sent = (
+                f'Part {part} in plant {plant} has excess {excess}; cancel PO {po_number} for quantity {po_qty} with delivery date {delivery}.'
+            )
+            if supplier_text:
+                sent = sent.rstrip('.') + '.' + supplier_text
+            return sent
+        if action == 'Move inventory to AGS':
+            return (
+                f'Part {part} in plant {plant} has excess {excess}; move {transfer_qty} inventory to AGS and align with demand. '
+                f'Target delivery date reference is {delivery}.'
+            )
+        if action == 'Move inventory':
+            return (
+                f'Part {part} in plant {plant} has excess {excess}; move {transfer_qty} inventory to plant {destination} to balance demand. '
+                f'Target delivery date reference is {delivery}.'
+            )
+        if action == 'Sell back to CM':
+            return (
+                f'Part {part} in plant {plant} has excess {excess}; kit code {kit_code} ({kit_desc}) is outsourced, so sell back inventory to CM. '
+                f'Delivery date reference is {delivery}.'
+            )
+        details = str(row.get('Action Details', '') or '').strip()
+        base = f'Part {part} in plant {plant} has excess {excess}; recommended action is {action}.'
+        if details:
+            base += f' {details}'
+        if delivery:
+            base += f' Delivery date reference is {delivery}.'
+        return base
+
+    @staticmethod
+    def _fmt_num(value: Any) -> str:
+        try:
+            if value is None or value == '' or pd.isna(value):
+                return '0'
+            return f'{float(value):,.3f}'
+        except Exception:
+            text = str(value or '').strip()
+            return text if text else '0'
+
+    @staticmethod
+    def _fmt_delivery(value: Any) -> str:
+        if value is None or value == '' or (isinstance(value, float) and pd.isna(value)):
+            return 'N/A'
+        try:
+            dt = pd.to_datetime(value, errors='coerce')
+            if pd.isna(dt):
+                text = str(value).strip()
+                return text if text else 'N/A'
+            return dt.strftime('%Y-%m-%d')
+        except Exception:
+            text = str(value).strip()
+            return text if text else 'N/A'
 
 class PlaceholderTab(QWidget):
     def __init__(self, title: str):
@@ -9157,10 +10043,11 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(OrphanAnalysisTab(self.obs_tab), "Orphan Analysis")
         self.structure_tab = StructureSheetTab(); self.tabs.addTab(self.structure_tab, "Structure sheet")
         self.inventory_cost_tab=InventoryCostTab(); self.tabs.addTab(self.inventory_cost_tab,'Inventory_Cost')
+        self.report_tab = ReportTab()
         self.tabs.addTab(PlaceholderTab("Safety"), "Safety")
         self.tabs.addTab(PlaceholderTab("CE!"), "CE!")
         self.tabs.addTab(PlaceholderTab("CDW"), "CDW")
-        self.tabs.addTab(PlaceholderTab("Report"), "Report")
+        self.tabs.addTab(self.report_tab, "Report")
         self.tabs.addTab(PlaceholderTab("User Notes"), "User Notes")
         self.setCentralWidget(self.tabs)
         self._tab_switch_guard = False
@@ -9249,6 +10136,10 @@ class MainWindow(QMainWindow):
                 finally:
                     self._tab_switch_guard = False
                 return
+
+        new_widget = self.tabs.widget(new_index)
+        if isinstance(new_widget, StructureSheetTab) and hasattr(new_widget, '_reapply_action_visibility_all_rows'):
+            new_widget._reapply_action_visibility_all_rows()
 
         self._prev_tab_index = new_index
 

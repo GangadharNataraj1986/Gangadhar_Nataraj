@@ -27,6 +27,15 @@ _IN_CHUNK_SIZE = 1000              # max parts per SQL IN list before splitting 
 _PARALLEL_SHARD_SIZE = 120         # per-query part count when parallelizing large runs
 _MAX_PARALLEL_WORKERS = 4          # safe upper bound for concurrent ODBC query threads
 
+# ---------------------------------------------------------------------------
+# Persistent shared connection for the Orphan Analysis WU import flow.
+# Unlike _THREAD_LOCAL (which creates a new connection per thread), this
+# connection is module-level and reused across multiple button clicks and
+# threads.  Only one non-parallel query uses it at a time.
+# ---------------------------------------------------------------------------
+_PERSISTENT_CONN: Any = None
+_PERSISTENT_CONN_LOCK = threading.Lock()
+
 # Lowercase SQL aliases returned in each row dict (matches the SELECT aliases below).
 DB_KEYS: list[str] = [
     "wu_level",
@@ -375,6 +384,45 @@ def _reset_conn() -> None:
         _THREAD_LOCAL.conn = None
 
 
+def _get_persistent_conn(pyodbc: Any) -> Any:
+    """Return the module-level persistent ODBC connection, creating it once if needed.
+
+    Unlike _get_conn(), this connection is NOT thread-local.  It is created once
+    and reused across all threads and button clicks.  _PERSISTENT_CONN_LOCK must
+    be held for the full duration of a query to prevent concurrent use.
+    """
+    global _PERSISTENT_CONN
+    if _PERSISTENT_CONN is None:
+        _PERSISTENT_CONN = pyodbc.connect(f"DSN={_DSN}", autocommit=True)
+    return _PERSISTENT_CONN
+
+
+def _reset_persistent_conn() -> None:
+    """Close and clear the persistent connection (e.g. after a connection error)."""
+    global _PERSISTENT_CONN
+    with _PERSISTENT_CONN_LOCK:
+        if _PERSISTENT_CONN is not None:
+            try:
+                _PERSISTENT_CONN.close()
+            except Exception:
+                pass
+            _PERSISTENT_CONN = None
+
+
+def pre_warm_connection() -> None:
+    """Pre-establish the persistent Databricks connection on the calling thread.
+
+    Call this once at application startup (in a background thread) so that the
+    first real query does not pay the 20-120s cluster cold-start cost.
+    """
+    try:
+        import pyodbc  # type: ignore[import]
+    except ImportError:
+        return
+    with _PERSISTENT_CONN_LOCK:
+        _get_persistent_conn(pyodbc)
+
+
 def _is_valid_part(part: str) -> bool:
     """Return True if *part* looks like a real part number.
 
@@ -666,6 +714,7 @@ def fetch_where_used_parents_only(
     obs_parts: list[str],
     max_level: int,
     plant: str = "4070",
+    log_callback=None,
 ) -> list[dict[str, Any]]:
     """Like fetch_where_used() but skips the level-0 Databricks lookup.
 
@@ -739,136 +788,156 @@ def fetch_where_used_parents_only(
     # LEFT JOINs to material_master and dimmaterialstatus.  After all traversal
     # levels complete, one _SQL_METADATA_BATCH query fetches metadata for all
     # unique discovered parents in a single round-trip.
-    conn = _get_conn(pyodbc)
-    try:
-        cursor = conn.cursor()
+    import time as _time
+
+    def _log(msg: str) -> None:
+        if log_callback:
+            log_callback(msg)
+
+    _log(f"[{_time.strftime('%H:%M:%S')}] Connecting to Databricks (Spark-PRD)...")
+    _t_conn = _time.perf_counter()
+    with _PERSISTENT_CONN_LOCK:
         try:
-            current_nodes: list[dict[str, Any]] = [
-                {
-                    "current_part": p,
-                    "input_part": p,
-                    "path": (p.upper(),),
-                    "cum_qty": 1.0,
-                }
-                for p in safe_parts
-            ]
-
-            for level in range(1, max_level + 1):
-                if not current_nodes:
-                    break
-
-                lookup_parts = list(dict.fromkeys(node["current_part"] for node in current_nodes))
-                rows_n, cols_n = _run_query_in_chunks(
-                    cursor,
-                    _SQL_LEVEL_N_TRAVERSE,
-                    lookup_parts,
-                    safe_plant,
-                )
-
-                rows_by_child: dict[str, list[dict[str, Any]]] = {}
-                for row in rows_n:
-                    rec = {
-                        col: ("" if val is None else str(val).strip())
-                        for col, val in zip(cols_n, row)
+            conn = _get_persistent_conn(pyodbc)
+            _already = _time.perf_counter() - _t_conn < 0.5
+            if _already:
+                _log(f"[{_time.strftime('%H:%M:%S')}] Reusing existing connection (instant).")
+            else:
+                _log(f"[{_time.strftime('%H:%M:%S')}] Connected in {_time.perf_counter() - _t_conn:.1f}s.")
+        except Exception:
+            _reset_persistent_conn()
+            raise
+        try:
+            cursor = conn.cursor()
+            try:
+                current_nodes: list[dict[str, Any]] = [
+                    {
+                        "current_part": p,
+                        "input_part": p,
+                        "path": (p.upper(),),
+                        "cum_qty": 1.0,
                     }
-                    _set_designator(rec)
-                    child_key = rec.get("child_part", "").upper()
-                    rows_by_child.setdefault(child_key, []).append(rec)
+                    for p in safe_parts
+                ]
 
-                next_nodes: list[dict[str, Any]] = []
+                for level in range(1, max_level + 1):
+                    if not current_nodes:
+                        break
 
-                for source in current_nodes:
-                    child = source["current_part"]
-                    child_key = child.upper()
-                    child_path_key = "->".join(source["path"])
-                    seen_parent_for_source: set[str] = set()
-                    for rec in rows_by_child.get(child_key, []):
-                        parent = rec.get("part", "")
-                        parent_key = parent.upper()
-                        if not _is_valid_part(parent):
+                    lookup_parts = list(dict.fromkeys(node["current_part"] for node in current_nodes))
+                    _log(f"[{_time.strftime('%H:%M:%S')}] Level {level}: querying {len(lookup_parts)} part(s)...")
+                    _tq = _time.perf_counter()
+                    rows_n, cols_n = _run_query_in_chunks(
+                        cursor,
+                        _SQL_LEVEL_N_TRAVERSE,
+                        lookup_parts,
+                        safe_plant,
+                    )
+                    _log(f"[{_time.strftime('%H:%M:%S')}] Level {level} done in {_time.perf_counter() - _tq:.1f}s — {len(rows_n)} rows returned.")
+
+                    rows_by_child: dict[str, list[dict[str, Any]]] = {}
+                    for row in rows_n:
+                        rec = {
+                            col: ("" if val is None else str(val).strip())
+                            for col, val in zip(cols_n, row)
+                        }
+                        _set_designator(rec)
+                        child_key = rec.get("child_part", "").upper()
+                        rows_by_child.setdefault(child_key, []).append(rec)
+
+                    next_nodes: list[dict[str, Any]] = []
+
+                    for source in current_nodes:
+                        child = source["current_part"]
+                        child_key = child.upper()
+                        child_path_key = "->".join(source["path"])
+                        seen_parent_for_source: set[str] = set()
+                        for rec in rows_by_child.get(child_key, []):
+                            parent = rec.get("part", "")
+                            parent_key = parent.upper()
+                            if not _is_valid_part(parent):
+                                continue
+                            if not parent_key or parent_key in seen_parent_for_source:
+                                continue
+                            seen_parent_for_source.add(parent_key)
+
+                            try:
+                                cum = float(source.get("cum_qty") or 1.0)
+                                bq = float(rec.get("base_qty") or 1.0)
+                                ext = round(cum * bq, 6)
+                            except (ValueError, TypeError):
+                                ext = float(rec.get("base_qty") or 1.0)
+
+                            rec_out = dict(rec)
+                            rec_out["wu_level"] = str(level)
+                            rec_out["ext_qty"] = str(ext)
+                            rec_out["input_part"] = source.get("input_part", child)
+                            rec_out["_child_path_key"] = child_path_key
+                            rec_out["_node_path_key"] = "->".join(source["path"] + (parent_key,))
+                            rec_out.setdefault("item_status", "")
+                            rec_out.setdefault("procurement_type", "")
+                            rec_out.setdefault("user_item_type", "")
+                            rec_out.setdefault("pace_or_dash", "")
+                            rec_out.setdefault("mlo_class", "")
+                            rec_out.setdefault("designator", "")
+                            rec_out.setdefault("option_class", "")
+                            records.append(rec_out)
+
+                            if parent_key not in source["path"]:
+                                next_nodes.append({
+                                    "current_part": parent,
+                                    "input_part": rec_out["input_part"],
+                                    "path": source["path"] + (parent_key,),
+                                    "cum_qty": ext,
+                                })
+
+                    current_nodes = next_nodes
+
+                # ── Single metadata batch for all discovered parents ───────────
+                parent_parts = list(dict.fromkeys(
+                    r["part"] for r in records if r.get("wu_level", "0") != "0" and r.get("part")
+                ))
+                if parent_parts:
+                    _log(f"[{_time.strftime('%H:%M:%S')}] Fetching metadata for {len(parent_parts)} unique parent part(s)...")
+                    _tm = _time.perf_counter()
+                    meta_map: dict[str, dict] = {}
+                    mr, mc = _run_query_in_chunks(
+                        cursor,
+                        _SQL_METADATA_BATCH,
+                        parent_parts,
+                        safe_plant,
+                    )
+                    _log(f"[{_time.strftime('%H:%M:%S')}] Metadata fetch done in {_time.perf_counter() - _tm:.1f}s.")
+                    for mrow in mr:
+                        md = {
+                            col: ("" if val is None else str(val).strip())
+                            for col, val in zip(mc, mrow)
+                        }
+                        meta_map[md["part"].upper()] = md
+                    for rec in records:
+                        if rec.get("wu_level", "0") == "0":
                             continue
-                        if not parent_key or parent_key in seen_parent_for_source:
-                            continue
-                        seen_parent_for_source.add(parent_key)
+                        meta = meta_map.get(rec["part"].upper(), {})
+                        rec["item_status"]      = meta.get("item_status", "")
+                        rec["procurement_type"] = meta.get("procurement_type", "")
+                        rec["user_item_type"]   = meta.get("user_item_type", "")
+                        rec["pace_or_dash"]     = meta.get("pace_or_dash", "")
+                        rec["mlo_class"]        = meta.get("mlo_class", "")
 
-                        try:
-                            cum = float(source.get("cum_qty") or 1.0)
-                            bq = float(rec.get("base_qty") or 1.0)
-                            ext = round(cum * bq, 6)
-                        except (ValueError, TypeError):
-                            ext = float(rec.get("base_qty") or 1.0)
+            finally:
+                cursor.close()
+        except Exception:
+            _reset_persistent_conn()
+            raise
 
-                        rec_out = dict(rec)
-                        rec_out["wu_level"] = str(level)
-                        rec_out["ext_qty"] = str(ext)
-                        rec_out["input_part"] = source.get("input_part", child)
-                        rec_out["_child_path_key"] = child_path_key
-                        rec_out["_node_path_key"] = "->".join(source["path"] + (parent_key,))
-                        # Pre-fill metadata fields that the traverse SQL omits;
-                        # they will be overwritten by the metadata batch below.
-                        rec_out.setdefault("item_status", "")
-                        rec_out.setdefault("procurement_type", "")
-                        rec_out.setdefault("user_item_type", "")
-                        rec_out.setdefault("pace_or_dash", "")
-                        rec_out.setdefault("mlo_class", "")
-                        rec_out.setdefault("designator", "")
-                        rec_out.setdefault("option_class", "")
-                        records.append(rec_out)
-
-                        if parent_key not in source["path"]:
-                            next_nodes.append({
-                                "current_part": parent,
-                                "input_part": rec_out["input_part"],
-                                "path": source["path"] + (parent_key,),
-                                "cum_qty": ext,
-                            })
-
-                current_nodes = next_nodes
-
-            # ── Single metadata batch for all discovered parents ───────────────
-            # One query replaces N per-level LEFT JOINs to material_master and
-            # dimmaterialstatus, giving Databricks one large set-based lookup
-            # instead of repeated dimension scans.
-            parent_parts = list(dict.fromkeys(
-                r["part"] for r in records if r.get("wu_level", "0") != "0" and r.get("part")
-            ))
-            if parent_parts:
-                meta_map: dict[str, dict] = {}
-                mr, mc = _run_query_in_chunks(
-                    cursor,
-                    _SQL_METADATA_BATCH,
-                    parent_parts,
-                    safe_plant,
-                )
-                for mrow in mr:
-                    md = {
-                        col: ("" if val is None else str(val).strip())
-                        for col, val in zip(mc, mrow)
-                    }
-                    meta_map[md["part"].upper()] = md
-                # Merge metadata into each non-L0 record
-                for rec in records:
-                    if rec.get("wu_level", "0") == "0":
-                        continue
-                    meta = meta_map.get(rec["part"].upper(), {})
-                    rec["item_status"]      = meta.get("item_status", "")
-                    rec["procurement_type"] = meta.get("procurement_type", "")
-                    rec["user_item_type"]   = meta.get("user_item_type", "")
-                    rec["pace_or_dash"]     = meta.get("pace_or_dash", "")
-                    rec["mlo_class"]        = meta.get("mlo_class", "")
-
-        finally:
-            cursor.close()
-    except Exception:
-        _reset_conn()
-        raise
-
+    _log(f"[{_time.strftime('%H:%M:%S')}] Sorting {len(records)} record(s) into tree order...")
     return _to_tree_order(records, safe_parts)
 
 
 def fetch_where_used_level1_fast(
     obs_parts: list[str],
     plant: str = "4070",
+    log_callback=None,
 ) -> list[dict[str, Any]]:
     """Fast path for single-level where-used (L1 only) with minimal overhead.
 
@@ -932,65 +1001,87 @@ def fetch_where_used_level1_fast(
             "_node_path_key": part.upper(),
         })
 
-    conn = _get_conn(pyodbc)
-    try:
-        cursor = conn.cursor()
+    import time as _time
+
+    def _log(msg: str) -> None:
+        if log_callback:
+            log_callback(msg)
+
+    _log(f"[{_time.strftime('%H:%M:%S')}] Connecting to Databricks (Spark-PRD)...")
+    _t_conn = _time.perf_counter()
+    with _PERSISTENT_CONN_LOCK:
         try:
-            if len(safe_parts) >= 200:
-                rows_l1, cols_l1 = _run_query_parallel_shards(
-                    _SQL_LEVEL_N_TRAVERSE,
-                    safe_parts,
-                    safe_plant,
-                )
+            conn = _get_persistent_conn(pyodbc)
+            _already = _time.perf_counter() - _t_conn < 0.5
+            if _already:
+                _log(f"[{_time.strftime('%H:%M:%S')}] Reusing existing connection (instant).")
             else:
-                rows_l1, cols_l1 = _run_query_in_chunks(
-                    cursor,
-                    _SQL_LEVEL_N_TRAVERSE,
-                    safe_parts,
-                    safe_plant,
-                )
+                _log(f"[{_time.strftime('%H:%M:%S')}] Connected in {_time.perf_counter() - _t_conn:.1f}s. Querying {len(safe_parts)} part(s) at WU Level 1...")
+        except Exception:
+            _reset_persistent_conn()
+            raise
+        try:
+            cursor = conn.cursor()
+            try:
+                _tq = _time.perf_counter()
+                if len(safe_parts) >= 200:
+                    _log(f"[{_time.strftime('%H:%M:%S')}] Large set ({len(safe_parts)} parts) — using parallel shards...")
+                    rows_l1, cols_l1 = _run_query_parallel_shards(
+                        _SQL_LEVEL_N_TRAVERSE,
+                        safe_parts,
+                        safe_plant,
+                    )
+                else:
+                    rows_l1, cols_l1 = _run_query_in_chunks(
+                        cursor,
+                        _SQL_LEVEL_N_TRAVERSE,
+                        safe_parts,
+                        safe_plant,
+                    )
+                _log(f"[{_time.strftime('%H:%M:%S')}] Query done in {_time.perf_counter() - _tq:.1f}s — {len(rows_l1)} raw rows returned.")
 
-            rows_by_child: dict[str, list[dict[str, Any]]] = {}
-            for row in rows_l1:
-                rec = {
-                    col: ("" if val is None else str(val).strip())
-                    for col, val in zip(cols_l1, row)
-                }
-                _set_designator(rec)
-                child_key = rec.get("child_part", "").upper()
-                rows_by_child.setdefault(child_key, []).append(rec)
+                rows_by_child: dict[str, list[dict[str, Any]]] = {}
+                for row in rows_l1:
+                    rec = {
+                        col: ("" if val is None else str(val).strip())
+                        for col, val in zip(cols_l1, row)
+                    }
+                    _set_designator(rec)
+                    child_key = rec.get("child_part", "").upper()
+                    rows_by_child.setdefault(child_key, []).append(rec)
 
-            for child in safe_parts:
-                child_key = child.upper()
-                seen_parent_for_child: set[str] = set()
-                for rec in rows_by_child.get(child_key, []):
-                    parent = rec.get("part", "")
-                    parent_key = parent.upper()
-                    if not _is_valid_part(parent):
-                        continue
-                    if not parent_key or parent_key in seen_parent_for_child:
-                        continue
-                    seen_parent_for_child.add(parent_key)
+                for child in safe_parts:
+                    child_key = child.upper()
+                    seen_parent_for_child: set[str] = set()
+                    for rec in rows_by_child.get(child_key, []):
+                        parent = rec.get("part", "")
+                        parent_key = parent.upper()
+                        if not _is_valid_part(parent):
+                            continue
+                        if not parent_key or parent_key in seen_parent_for_child:
+                            continue
+                        seen_parent_for_child.add(parent_key)
 
-                    rec_out = dict(rec)
-                    rec_out["wu_level"] = "1"
-                    rec_out["ext_qty"] = str(rec.get("base_qty", ""))
-                    rec_out["input_part"] = child
-                    rec_out["_child_path_key"] = child_key
-                    rec_out["_node_path_key"] = f"{child_key}->{parent_key}"
-                    rec_out.setdefault("item_status", "")
-                    rec_out.setdefault("procurement_type", "")
-                    rec_out.setdefault("user_item_type", "")
-                    rec_out.setdefault("pace_or_dash", "")
-                    rec_out.setdefault("mlo_class", "")
-                    rec_out.setdefault("designator", "")
-                    rec_out.setdefault("option_class", "")
-                    records.append(rec_out)
+                        rec_out = dict(rec)
+                        rec_out["wu_level"] = "1"
+                        rec_out["ext_qty"] = str(rec.get("base_qty", ""))
+                        rec_out["input_part"] = child
+                        rec_out["_child_path_key"] = child_key
+                        rec_out["_node_path_key"] = f"{child_key}->{parent_key}"
+                        rec_out.setdefault("item_status", "")
+                        rec_out.setdefault("procurement_type", "")
+                        rec_out.setdefault("user_item_type", "")
+                        rec_out.setdefault("pace_or_dash", "")
+                        rec_out.setdefault("mlo_class", "")
+                        rec_out.setdefault("designator", "")
+                        rec_out.setdefault("option_class", "")
+                        records.append(rec_out)
 
-        finally:
-            cursor.close()
-    except Exception:
-        _reset_conn()
-        raise
+            finally:
+                cursor.close()
+        except Exception:
+            _reset_persistent_conn()
+            raise
 
+    _log(f"[{_time.strftime('%H:%M:%S')}] Processing complete. {len(records)} total record(s) ready.")
     return _to_tree_order(records, safe_parts)
