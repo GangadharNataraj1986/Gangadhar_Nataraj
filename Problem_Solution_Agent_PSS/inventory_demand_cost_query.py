@@ -21,13 +21,13 @@ Verified Databricks source mapping
     - Columns: quantity, quantity_of_goods_received
     - Logic: SUM(quantity - quantity_of_goods_received) where remaining qty > 0
 
-4. Gross Demand (latest snapshot, excluding PlannedPO)
-    - Schema.Table: prd.pd_mm.factknxssplyconsmp
-    - Columns: snapshotdate, spart, partsite, stype, dduedate, dqty
-    - Logic:
-      - latest snapshot per (spart, partsite)
-      - exclude stype = 'PlannedPO'
-      - bucket and sum TRY_CAST(dqty) into 13/26/52-week windows
+4. Gross Demand (MM360-aligned)
+        - Schema.Table: prd.ud_gsco.vw_active_items
+        - Columns: demand13wk, demand26wk, ssg_52_wk_dmd, ags_52_wk_dmd
+        - Logic:
+            - Demand-13 = demand13wk
+            - Demand-26 = demand26wk
+            - Demand-52 = ssg_52_wk_dmd + ags_52_wk_dmd
 
 5. Cost behavior
     - Standard Cost USD is returned only when on-hand inventory exists (> 0)
@@ -151,43 +151,20 @@ open_po AS (
       AND (COALESCE(quantity, 0) - COALESCE(quantity_of_goods_received, 0)) > 0
     GROUP BY material_number, plant_code
 ),
-latest_snapshot AS (
-    SELECT
-        spart AS materialnum,
-        partsite AS plantcd,
-        MAX(snapshotdate) AS snapshotdate
-    FROM prd.pd_mm.factknxssplyconsmp
-    WHERE spart IN ({part_filter})
-      AND partsite IN ({plant_filter})
-      AND LOWER(COALESCE(stype, '')) IN ('quotation', 'gforecast')
-    GROUP BY spart, partsite
-),
 demand_buckets AS (
     SELECT
-        f.spart AS materialnum,
-        f.partsite AS plantcd,
-        SUM(CASE
-                WHEN DATEDIFF(TRY_CAST(f.dduedate AS DATE), CURRENT_DATE()) BETWEEN 0 AND 91
-                    THEN COALESCE(TRY_CAST(f.dqty AS DECIMAL(38, 3)), 0)
-                ELSE 0
-            END) AS gross_demand_13w,
-        SUM(CASE
-                WHEN DATEDIFF(TRY_CAST(f.dduedate AS DATE), CURRENT_DATE()) BETWEEN 0 AND 182
-                    THEN COALESCE(TRY_CAST(f.dqty AS DECIMAL(38, 3)), 0)
-                ELSE 0
-            END) AS gross_demand_26w,
-        SUM(CASE
-                WHEN DATEDIFF(TRY_CAST(f.dduedate AS DATE), CURRENT_DATE()) BETWEEN 0 AND 364
-                    THEN COALESCE(TRY_CAST(f.dqty AS DECIMAL(38, 3)), 0)
-                ELSE 0
-            END) AS gross_demand_52w
-    FROM prd.pd_mm.factknxssplyconsmp f
-    INNER JOIN latest_snapshot ls
-        ON f.spart = ls.materialnum
-       AND f.partsite = ls.plantcd
-       AND f.snapshotdate = ls.snapshotdate
-    WHERE LOWER(COALESCE(f.stype, '')) IN ('quotation', 'gforecast')
-    GROUP BY f.spart, f.partsite
+        materialnum,
+        plantcd,
+        MAX(COALESCE(TRY_CAST(demand13wk AS DECIMAL(38, 3)), 0)) AS gross_demand_13w,
+        MAX(COALESCE(TRY_CAST(demand26wk AS DECIMAL(38, 3)), 0)) AS gross_demand_26w,
+        MAX(
+            COALESCE(TRY_CAST(ssg_52_wk_dmd AS DECIMAL(38, 3)), 0)
+          + COALESCE(TRY_CAST(ags_52_wk_dmd AS DECIMAL(38, 3)), 0)
+        ) AS gross_demand_52w
+    FROM prd.ud_gsco.vw_active_items
+    WHERE materialnum IN ({part_filter})
+      AND plantcd IN ({plant_filter})
+    GROUP BY materialnum, plantcd
 )
 SELECT
     grid.part_number                                              AS part_number,
@@ -209,18 +186,21 @@ SELECT
     CAST(COALESCE(dem.gross_demand_26w, 0) AS DECIMAL(18, 3))     AS gross_demand_26w,
     CAST(COALESCE(dem.gross_demand_52w, 0) AS DECIMAL(18, 3))     AS gross_demand_52w,
     CAST(CASE
-            WHEN COALESCE(oh.on_hand_qty, 0) > 0 THEN COALESCE(mm.stdcost_usd, 0)
+            WHEN (COALESCE(oh.on_hand_qty, 0) > 0 OR COALESCE(po.open_order_qty, 0) > 0)
+                THEN COALESCE(mm.stdcost_usd, 0)
             ELSE 0
         END AS DECIMAL(18, 3))                                    AS standard_cost_usd,
-    CAST(COALESCE(oh.on_hand_qty, 0) *
+    CAST((COALESCE(oh.on_hand_qty, 0) + COALESCE(po.open_order_qty, 0)) *
         CASE
-            WHEN COALESCE(oh.on_hand_qty, 0) > 0 THEN COALESCE(mm.stdcost_usd, 0)
+            WHEN (COALESCE(oh.on_hand_qty, 0) > 0 OR COALESCE(po.open_order_qty, 0) > 0)
+                THEN COALESCE(mm.stdcost_usd, 0)
             ELSE 0
         END AS DECIMAL(18, 3))
                                                                  AS inventory_cost_usd,
     CAST((COALESCE(oh.on_hand_qty, 0) + COALESCE(po.open_order_qty, 0)) *
         CASE
-            WHEN COALESCE(oh.on_hand_qty, 0) > 0 THEN COALESCE(mm.stdcost_usd, 0)
+            WHEN (COALESCE(oh.on_hand_qty, 0) > 0 OR COALESCE(po.open_order_qty, 0) > 0)
+                THEN COALESCE(mm.stdcost_usd, 0)
             ELSE 0
         END AS DECIMAL(18, 3))
                                                                  AS supply_cost_usd
