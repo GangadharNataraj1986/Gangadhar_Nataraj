@@ -1,3 +1,42 @@
+# --- Helper to extract Part No, Supplier, MPN lines from SPS text ---
+def _extract_part_supplier_mpn_lines(*texts: str) -> str:
+    """
+    Extracts lines or phrases containing Part No, Supplier, and MPN from SPS Problem/Solution text.
+    Returns a formatted string with one line per match.
+    """
+    import re
+    results = []
+    patterns = [
+        r"Part\s*No\s*[:#]?\s*([\w\-]+)",
+        r"Supplier\s*[:#]?\s*([\w\s\-&.,]+)",
+        r"MPN\s*[:#]?\s*([\w\-]+)",
+        r"Manufacturer\s*[:#]?\s*([\w\s\-&.,]+)",
+        r"Vendor\s*[:#]?\s*([\w\s\-&.,]+)",
+    ]
+    # Combine all text
+    combined = "\n".join([t for t in texts if t])
+    # Extract lines with all three fields if possible
+    # Look for lines like: Part No: 5620-44561 | Supplier: ABC Electronics | MPN: ABC9876X
+    line_pattern = re.compile(r"Part\s*No\s*[:#]?\s*([\w\-]+)[^\n\r]*Supplier\s*[:#]?\s*([\w\s\-&.,]+)[^\n\r]*MPN\s*[:#]?\s*([\w\-]+)", re.IGNORECASE)
+    for match in line_pattern.finditer(combined):
+        pn, supplier, mpn = match.groups()
+        results.append(f"Part No: {pn.strip()} | Supplier: {supplier.strip()} | MPN: {mpn.strip()}")
+    # If not found, try to extract individual fields and combine
+    if not results:
+        part_nos = re.findall(r"Part\s*No\s*[:#]?\s*([\w\-]+)", combined, re.IGNORECASE)
+        suppliers = re.findall(r"Supplier\s*[:#]?\s*([\w\s\-&.,]+)", combined, re.IGNORECASE)
+        mpns = re.findall(r"MPN\s*[:#]?\s*([\w\-]+)", combined, re.IGNORECASE)
+        # Combine by index if possible
+        for i in range(max(len(part_nos), len(suppliers), len(mpns))):
+            pn = part_nos[i] if i < len(part_nos) else ""
+            supplier = suppliers[i] if i < len(suppliers) else ""
+            mpn = mpns[i] if i < len(mpns) else ""
+            if pn or supplier or mpn:
+                line = " | ".join(filter(None, [f"Part No: {pn.strip()}" if pn else "", f"Supplier: {supplier.strip()}" if supplier else "", f"MPN: {mpn.strip()}" if mpn else ""]))
+                results.append(line)
+    # Remove duplicates
+    results = list(dict.fromkeys([r for r in results if r.strip()]))
+    return "\n".join(results)
 import os
 import re
 import json
@@ -27,96 +66,6 @@ if not DATABRICKS_URL or not DATABRICKS_API_KEY:
 else:
     print("Databricks environment variables loaded successfully.")
 
-
-
-
-
-# ----------------------------
-# NEW: SPS PREPROCESSOR
-# ----------------------------
-def preprocess_sps_text(user_text: str) -> str:
-    if not user_text:
-        return ""
-
-    problem_lines = []
-    solution_lines = []
-    issue_parts = []
-    parent_parts = []
-    esw_lines = []
-
-    lines = user_text.splitlines()
-
-    for line in lines:
-        l = line.strip()
-
-        # Problem extraction
-        if "supplier-reported issue" in l.lower():
-            problem_lines.append(l.split(":", 1)[-1].strip())
-
-        # Solution extraction
-        elif "supplier-proposed change" in l.lower():
-            solution_lines.append(l.split(":", 1)[-1].strip())
-
-        # Part number extraction
-        parts = re.findall(r"\b\d{4}-\d{5}\b", l)
-        if parts:
-            if "part number" in l.lower():
-                parent_parts.extend(parts)
-            else:
-                issue_parts.extend(parts)
-
-        # ESW detection
-        if "esw" in l.lower():
-            esw_lines.append(l)
-
-        # Replacement detection
-        match = re.search(
-            r"change\s+(\d{4}-\d{5})\s+to\s+(\d{4}-\d{5})",
-            l,
-            re.IGNORECASE,
-        )
-        if match:
-            old_part = match.group(1)
-            new_part = match.group(2)
-
-            issue_parts.append(old_part)
-            solution_lines.append(f"Replace {old_part} with {new_part}")
-
-    # Remove duplicates
-    issue_parts = list(dict.fromkeys(issue_parts))
-    parent_parts = list(dict.fromkeys(parent_parts))
-
-    # Build structured text
-    structured = []
-
-    if problem_lines:
-        structured.append(
-            "Problem:\n" + "\n".join(f"- {p}" for p in problem_lines)
-        )
-
-    if solution_lines:
-        structured.append(
-            "Solution:\n" + "\n".join(f"- {s}" for s in solution_lines)
-        )
-
-    if issue_parts:
-        structured.append(
-            "Issue Part Number(s):\n" + ", ".join(issue_parts)
-        )
-
-    if parent_parts:
-        structured.append(
-            "Parent Part Number(s):\n" + ", ".join(parent_parts)
-        )
-
-    if esw_lines:
-        structured.append(
-            "ESW:\n" + "\n".join(esw_lines)
-        )
-
-    return "\n\n".join(structured)
-
-
 # ----------------------------
 # Constants
 # ----------------------------
@@ -135,6 +84,8 @@ TOP_LEVEL_SECTION_NAMES = [
 
 PROBLEM_SUBSECTION_NAMES = [
     "Change Drivers",
+    "Affected/Impacted Part Numbers",
+    "Affected Part Numbers",
     "Issue Part Number(s)",
     "Issue Part Numbers",
     "Problem Description",
@@ -185,6 +136,216 @@ ENGINEERING_SHORTCUTS: List[Tuple[str, str]] = [
     ("Assembly", "Assy."),
 ]
 
+_SPS_TEMPLATE_CATALOG: List[Dict[str, str]] = [
+    {
+        "main_group": "Supply Chain",
+        "sub_group": "Obsolescence",
+        "sub_sub_category": "End Of Life(EOL)",
+        "title_template": "Supplier declared part obsolete (EOL)",
+        "problem_template": (
+            "Below OEM components have been declared End-of-Life (EOL) by suppliers, posing a risk "
+            "to supply continuity and production. Affected Parts and Suppliers: Part No, Supplier, MPN."
+        ),
+        "solution_template": (
+            "Qualified replacement parts have been identified for supplier-declared EOL components. "
+            "Existing parts will be obsoleted and replaced with approved components, and affected "
+            "parent structures will be revised or obsoleted through ECO implementation."
+        ),
+    },
+    {
+        "main_group": "Supply Chain",
+        "sub_group": "Supplier Change",
+        "sub_sub_category": "Spec/Process Change",
+        "title_template": "Supplier changed spec/material/process without approval",
+        "problem_template": (
+            "Below parts have undergone specification, material, or process changes by the supplier "
+            "without prior approval, potentially impacting performance, quality, and compliance."
+        ),
+        "solution_template": (
+            "Document the supplier-implemented change, define the required approval or corrective action, "
+            "and update affected engineering records using only confirmed SPS solution facts."
+        ),
+    },
+    {
+        "main_group": "Supply Chain",
+        "sub_group": "Supplier No longer Supply / Supplier out of Business",
+        "sub_sub_category": "General",
+        "title_template": "Supplier No Longer Supply / Supplier Out of Business",
+        "problem_template": (
+            "Approved supplier(s) for certain components have ceased supply or gone out of business, "
+            "resulting in part unavailability and risk to production continuity."
+        ),
+        "solution_template": (
+            "Alternate supplier(s) and replacement parts have been identified and qualified to address "
+            "component unavailability, and affected BOM or AVL structures will be updated accordingly."
+        ),
+    },
+    {
+        "main_group": "Supply Chain",
+        "sub_group": "AVL Management",
+        "sub_sub_category": "New Supplier Addition / Alternate Supplier",
+        "title_template": "Add new supplier for lead time",
+        "problem_template": (
+            "Existing approved supplier(s) are experiencing extended lead times and supply constraints, "
+            "creating risk to material availability and production schedules."
+        ),
+        "solution_template": (
+            "New supplier(s) have been identified and qualified to address lead time constraints and "
+            "ensure supply continuity, with approved supplier lists updated accordingly."
+        ),
+    },
+    {
+        "main_group": "Engineering",
+        "sub_group": "Design Issues",
+        "sub_sub_category": "Fit/Interference",
+        "title_template": "Design causing interference/assembly issues",
+        "problem_template": (
+            "The current design is causing fitment or interference issues during assembly, affecting "
+            "alignment, assembly process, and product quality."
+        ),
+        "solution_template": (
+            "Modify geometry, dimensions, or tolerances to eliminate interference. If needed, either "
+            "revise the existing part or obsolete it and create a new interchangeable part."
+        ),
+    },
+    {
+        "main_group": "Engineering",
+        "sub_group": "Design Issues",
+        "sub_sub_category": "Performance Gap",
+        "title_template": "Design not meeting performance requirements",
+        "problem_template": (
+            "The current design is not meeting required performance criteria, leading to functional "
+            "limitations and product quality concerns."
+        ),
+        "solution_template": (
+            "Redesign the component to meet performance requirements and, when applicable, obsolete the "
+            "old part in favor of a validated interchangeable replacement."
+        ),
+    },
+    {
+        "main_group": "Engineering",
+        "sub_group": "Tolerance Issues",
+        "sub_sub_category": "Unachievable Tolerance",
+        "title_template": "Tolerances not manufacturable/measurable",
+        "problem_template": (
+            "Specified tolerances are not manufacturable or measurable with current process capability, "
+            "leading to production and inspection challenges."
+        ),
+        "solution_template": (
+            "Review and modify tolerances using capability-study evidence to ensure manufacturability and "
+            "measurability while preserving functional requirements."
+        ),
+    },
+    {
+        "main_group": "Engineering",
+        "sub_group": "Drawing Issues",
+        "sub_sub_category": "Missing Dimension",
+        "title_template": "Drawings missing dimensions",
+        "problem_template": (
+            "The drawing has missing or incorrect dimensions identified during manufacturing or inspection, "
+            "creating fabrication ambiguity and inspection difficulty."
+        ),
+        "solution_template": (
+            "Update the drawing with the required dimension details from confirmed SPS solution content, "
+            "using explicit old or new dimension facts only when present in the source."
+        ),
+    },
+    {
+        "main_group": "Engineering",
+        "sub_group": "Drawing Issues",
+        "sub_sub_category": "DWG Note Correction",
+        "title_template": "Non-standard notes/specifications used",
+        "problem_template": (
+            "Supplier has notified that drawing notes are inconsistent, incomplete, or unclear, leading "
+            "to ambiguity in manufacturing, quality, and compliance requirements."
+        ),
+        "solution_template": (
+            "Review and revise the affected drawing notes to eliminate ambiguity and align engineering, "
+            "manufacturing, and quality requirements."
+        ),
+    },
+    {
+        "main_group": "Engineering",
+        "sub_group": "BOM Issues",
+        "sub_sub_category": "Incorrect Qty",
+        "title_template": "Mismatch in quantity vs assembly requirement",
+        "problem_template": (
+            "The BOM contains incorrect component quantity that does not match the actual assembly "
+            "requirement, causing configuration and material planning issues."
+        ),
+        "solution_template": (
+            "Correct BOM quantities to align with actual assembly requirements, using explicit From and To "
+            "quantity facts when available in the SPS solution."
+        ),
+    },
+    {
+        "main_group": "Engineering",
+        "sub_group": "BOM Issues",
+        "sub_sub_category": "Missing Components",
+        "title_template": "Required components missing from BOM",
+        "problem_template": (
+            "The BOM is missing required components needed for proper assembly and functionality, creating "
+            "risk of incomplete assembly and production delay."
+        ),
+        "solution_template": (
+            "Update the BOM to include all missing components required for proper assembly and functionality."
+        ),
+    },
+    {
+        "main_group": "Engineering",
+        "sub_group": "BOM Issues",
+        "sub_sub_category": "Wrong Part",
+        "title_template": "Incorrect part referenced in BOM",
+        "problem_template": (
+            "The BOM references an incorrect part number that does not match the actual design or assembly "
+            "requirement, creating risk of wrong build and rework."
+        ),
+        "solution_template": (
+            "Replace incorrect BOM part numbers with the required components and identify the impacted item "
+            "positions when that detail is explicitly present."
+        ),
+    },
+    {
+        "main_group": "Engineering",
+        "sub_group": "Drawing Issues",
+        "sub_sub_category": "Ballon Callouts",
+        "title_template": "Balloon Callout Correction",
+        "problem_template": (
+            "The drawing contains missing or incorrect balloon callouts, creating improper part "
+            "identification, incorrect BOM linkage, and inspection confusion."
+        ),
+        "solution_template": (
+            "Review and correct balloon callouts to ensure proper mapping between the drawing and BOM."
+        ),
+    },
+    {
+        "main_group": "Engineering",
+        "sub_group": "Drawing Issues",
+        "sub_sub_category": "Incorrect labeling / Wrong labeling",
+        "title_template": "Incorrect / Wrong Labeling",
+        "problem_template": (
+            "The drawing contains incorrect labeling, leading to feature misinterpretation, assembly error, "
+            "and inspection risk."
+        ),
+        "solution_template": (
+            "Review and correct the affected labels so features and components are accurately identified."
+        ),
+    },
+    {
+        "main_group": "Engineering",
+        "sub_group": "Drawing Issues",
+        "sub_sub_category": "Incorrect Flow Direction Labels",
+        "title_template": "Flow Direction Label Correction",
+        "problem_template": (
+            "The drawing contains incorrect or missing flow direction labels, leading to orientation error, "
+            "functional issues, and process ambiguity."
+        ),
+        "solution_template": (
+            "Review and correct flow direction labels to ensure proper orientation and function per design intent."
+        ),
+    },
+]
+
 # ----------------------------
 # Change Initiator + Part/Commodity Rules (injected into LLM prompt)
 # ----------------------------
@@ -203,6 +364,7 @@ _CHANGE_INITIATOR_PART_COMMODITY_RULES: str = (
     "- Title, Problem Description, Solution Description, Impact Details, and Benefits must be anchored to the Primary Issue/Problem while remaining consistent with PCR/Project context.\n\n"
     "PART NUMBER RELATIONSHIP LOGIC (MANDATORY):\n"
     "- Issue Part Number(s): the part number(s) carrying or causing the issue.\n"
+    "- Affected Part Number(s): parent part number(s) impacted by the issue.\n"
     "- Resolve relationships bottom-up (where-used style): issue child can report to single or multi-level parents up to options structures.\n"
     "- Use BOM hierarchy context consistently in Problem and Solution text.\n"
     "- If available, align to this reporting model:\n"
@@ -224,15 +386,8 @@ _CHANGE_INITIATOR_PART_COMMODITY_RULES: str = (
     "- Cap Code or T&D Option codes: 0417, 0411, 0412, 0413, 0414, 0367.\n\n"
     "OEM TYPE GUIDANCE:\n"
     "- OEM: commodity code >= 0500.\n"
-    "- OEM family classification to preserve in narrative:\n"
-    "  * Mechanical Family: commodity code 3000-3999.\n"
-    "  * Chemicals / Consumables: commodity code 5000-5099.\n"
-    "  * Special / Reserved codes: 6000, 7000, 7779, 8888, 9000, 9992-9998.\n"
     "- Modified OEM / Modified Purchase Part: 0015.\n"
     "- Spec Controlled OEM: 0195.\n"
-    "- For OEM Applied part numbers, suppliers may maintain Alias ID (supplier short name), MPN (manufacturer part number), and TDS (technical data sheet). Preserve MPN/TDS facts when present.\n"
-    "- Supplier hierarchy context to preserve when available: Tier 1 (direct supplier to Applied Materials), Tier 2 (supplier to Tier 1), OEM supplier (upstream OEM source).\n"
-    "- OBSOLESCENCE OWNERSHIP RULE (MANDATORY): Supplier cannot obsolete an Applied Materials part number directly. Supplier obsoletes its OEM MPN and notifies Applied Materials. Applied Materials must review and approve proposed replacement or identify alternate replacement.\n"
     "- When OEM supplier/manufacturer part numbers are provided, preserve them explicitly in narrative where applicable.\n"
 )
 
@@ -555,42 +710,21 @@ _FROM_TO_FORMAT_RULES: str = (
     "- Preferred sentence pattern:\n"
     "    Supplier notified that <what changed> From: <old value> To: <new value>.\n"
     "- Do not place a standalone line like \"From: ... To: ...\" at the end of Problem Description.\n"
-    "- In Solution Description, From/To may be shown either inline or on separate lines.\n"
-    "- From: and To: labels will be displayed in bold in the final output (applied automatically — no special markup needed)."
-)
-
-_PROBLEM_GROUPING_RULES: str = (
-    "PART NUMBER DE-DUPLICATION AND CHANGE GROUPING (MANDATORY):\n"
-    "- Applied Materials part number (NNNN-NNNNN format) must appear AT MOST ONCE across the entire Problem Description.\n"
-    "  - State the Applied Materials P/N ONCE in the first introductory or context sentence only.\n"
-    "  - ALL subsequent bullets must refer to 'the part', 'this component', the supplier MPN, or just the change item.\n"
-    "  - Do NOT repeat the Applied Materials P/N in any bullet that describes an individual change.\n"
-    "- GROUPING (MANDATORY when 3 or more distinct change types are present in the input):\n"
-    "  - Do NOT write each supplier-driven change as a flat independent bullet at the same level.\n"
-    "  - GROUP changes under numbered category headers. Use ONLY categories that have actual content:\n"
-    "      1. Supplier-Driven Obsolescence   (lifecycle/EOL/obsolescence reason)\n"
-    "      2. Electronic Component Changes   (ICs, photocouplers, semiconductors, DeviceNet)\n"
-    "      3. Mechanical / Hardware Changes  (connectors, PCBs, enclosures, structural parts)\n"
-    "      4. Firmware / Software Changes    (firmware version updates, software revisions)\n"
-    "      5. Process / Design Changes       (process improvements, characterization, design corrections)\n"
-    "  - Each numbered category is a header line, followed by sub-bullets for each change in that category.\n"
-    "  - For component changes use format: Old MPN changed to New MPN: description (From: <old> To: <new> for versions).\n"
-    "  - PLAIN TEXT ONLY: No arrows (->), Unicode symbols, or special characters. Use only plain hyphens (-) for sub-bullets.\n"
-    "  - Skip any category that has no content from the input.\n"
-    "  - If only one category applies, write that single category with its sub-bullets (no grouping header needed).\n"
+    "- In Solution Description, From/To may be shown either inline or on separate lines."
 )
 
 _OMS_DOMAIN_RULES: str = (
     "OMS DOMAIN RULE (MANDATORY \u2014 applies to entire output):\n"
     "- Any part number that starts with '0251-' is an OMS document. Always refer to it as 'OMS <part-number>' (e.g. OMS 0251-12345). Never use the raw part number alone for these items.\n"
     "- OMS BOM HIERARCHY: OMS documents (0251-xxxxx) are child parts that ALWAYS report to either a Kit (0241-xxxxx) or an Assembly (0010-xxxxx / 0011-xxxxx) parent part number.\n"
+    "  - In Affected/Impacted Part Numbers or Affected Part Number(s): list the Kit or Assy parent.\n"
     "  - In Issue Part Number(s): list each OMS document individually, one per line.\n"
     "- OMS LIST FORMAT (MANDATORY): NEVER list multiple OMS documents on a single line separated by dashes or commas. Each OMS document MUST appear on its own separate line.\n"
     "  WRONG:  OMS 0251-18026 - OMS 0251-23910 - OMS 0251-00319\n"
     "  RIGHT:  OMS 0251-18026\n"
     "          OMS 0251-23910\n"
     "          OMS 0251-00319\n"
-    "- Page numbers in brackets must NOT appear in Issue Part Number(s) sections. Page numbers belong only in Solution Description sub-bullets."
+    "- Page numbers in brackets must NOT appear in Affected Part Number(s) or Issue Part Number(s) sections. Page numbers belong only in Solution Description sub-bullets."
 )
 
 _OMS_GROUPING_RULES: str = (
@@ -629,7 +763,7 @@ _SC_SUPPRESSION_RULES: str = (
     "    - Supplier inventory status language (e.g., \"no on-hand inventory\", \"reported at zero units\", \"covering demand only through\")\n"
     "- REPLACEMENT RULE: If ANY of the above are detected in the input, you MUST NOT reproduce them in Problem Description or Solution Description.\n"
     "  Instead, select EXACTLY ONE statement from the list below that best describes the supply risk, and use it in Problem Description.\n"
-    "- FORMAT: State the chosen statement followed by the issue part number(s). Do NOT cite any SPS number.\n"
+    "- FORMAT: State the chosen statement followed by the affected part number(s). Do NOT cite any SPS number.\n"
     "  Pattern: \"<Chosen statement> \u2014 Part Number(s): <part number(s)>.\"\n"
     "- APPROVED REPLACEMENT STATEMENTS \u2014 select EXACTLY ONE that best matches the detected supply risk condition:\n"
     "    * Short-Term Coverage Only: Confirmed inbound supply supports demand through the near-term horizon only, with no secured coverage beyond that period.\n"
@@ -782,7 +916,7 @@ def _select_problem_category_and_title_label(
                     )
                 return (
                     "Supply Chain Issues / EOL - Replacement Not Yet Identified",
-                    "OEM EOL Declaration by Supplier",
+                    "EOL / Obsolescence - Supply Chain Action Required",
                 )
         if re.search(r"\b(alternate\s+supplier|supply\s+disruption|supplier\s+disruption)\b", text):
             return (
@@ -855,6 +989,140 @@ def _build_selected_taxonomy_prompt_block(selected_category: str, approved_title
         "- Use the approved title label verbatim as the title issue phrase.\n"
         "- Do NOT perform full taxonomy exploration or remap to another category unless input facts clearly contradict this selection."
     )
+
+
+def _compact_sps_template_text(text: str, max_chars: int = 220) -> str:
+    normalized = re.sub(r"\s+", " ", str(text or "")).strip()
+    if len(normalized) <= max_chars:
+        return normalized
+    return normalized[: max_chars - 3].rstrip(" ,;:-") + "..."
+
+
+def _select_sps_template_candidates(user_text: str, max_items: int = 6) -> List[Dict[str, str]]:
+    text = (user_text or "").lower()
+    if not text:
+        return _SPS_TEMPLATE_CATALOG[:max_items]
+
+    stop_words = {
+        "and", "for", "with", "from", "that", "this", "have", "been", "into", "part", "parts",
+        "issue", "issues", "change", "changes", "drawing", "drawings", "supplier", "component", "components",
+    }
+
+    scored: List[Tuple[int, Dict[str, str]]] = []
+    for template in _SPS_TEMPLATE_CATALOG:
+        source = " ".join(
+            [
+                template.get("main_group", ""),
+                template.get("sub_group", ""),
+                template.get("sub_sub_category", ""),
+                template.get("title_template", ""),
+            ]
+        ).lower()
+        terms = [t for t in re.findall(r"[a-z0-9]+", source) if len(t) >= 4 and t not in stop_words]
+        if not terms:
+            scored.append((0, template))
+            continue
+
+        score = 0
+        for term in set(terms):
+            if term in text:
+                score += 3
+        # Boost category-specific high-signal terms.
+        if "torque" in text and template.get("sub_sub_category", "") in {"Missing Dimension", "DWG Note Correction"}:
+            score += 2
+        if "obsolete" in text or "eol" in text:
+            if "obsolescence" in template.get("sub_group", "").lower():
+                score += 4
+        if "bom" in text and "bom" in template.get("sub_group", "").lower():
+            score += 4
+        scored.append((score, template))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    selected = [item for score, item in scored if score > 0][:max_items]
+    if len(selected) < 3:
+        for _, item in scored:
+            if item not in selected:
+                selected.append(item)
+            if len(selected) >= min(max_items, 4):
+                break
+    return selected[:max_items]
+
+
+def _build_sps_template_prompt_block(user_text: str = "") -> str:
+    selected_templates = _select_sps_template_candidates(user_text)
+    lines = [
+        "SPS TEMPLATE CLASSIFICATION AND DRAFTING (MANDATORY WHEN SPS RECORDS EXIST):",
+        "- Scope: These SPS template rules control Title, Problem Description, and Solution Description when SPS records exist.",
+        "- Classify each SPS record using ONLY the SPS 'Supplier-reported issue' field and SPS 'Supplier solution' field.",
+        "- Explicitly ignore any SPS proposed solution field. It is not authorized for SPS template selection or drafting.",
+        "- Categorize the SPS problem into Main Group, Sub Group, and Sub Sub Category using the catalog below.",
+        "- If one SPS issue spans multiple categories, combine or blend the relevant templates so every SPS issue is covered.",
+        "- If no exact category fits, draft in the same structured style as the closest SPS template instead of reverting to free-form writing.",
+        "- All part numbers, suppliers, MPNs, quantities, notes, dimensions, and placeholders inside the examples are illustrative only. Never copy example literals unless they appear in the current input.",
+        "- Keep Change Drivers, ESW Turn Around, Impact Details, and Benefits of the Proposed Solution aligned with the existing pipeline.",
+        "- Before finalizing the draft, self-review Title, Problem Description, and Solution Description against the selected SPS template(s) and rewrite until the template style is followed.",
+        "- Do NOT mention SPS numbers in the output.",
+        "",
+        "SPS TEMPLATE CATALOG (FOCUSED SET):",
+    ]
+    for idx, template in enumerate(selected_templates, start=1):
+        lines.append(
+            f"{idx}. Main Group: {template['main_group']} | Sub Group: {template['sub_group']} | "
+            f"Sub Sub Category: {template['sub_sub_category']}"
+        )
+        lines.append(f"   Title Example: {template['title_template']}")
+        lines.append(f"   Problem Style: {_compact_sps_template_text(template['problem_template'], max_chars=140)}")
+        lines.append(f"   Solution Style: {_compact_sps_template_text(template['solution_template'], max_chars=140)}")
+    return "\n".join(lines).strip()
+
+
+def _build_sps_title_rules() -> str:
+    return (
+        "TITLE:\n"
+        "- SPS TEMPLATE MODE: classify SPS issues first, then derive the title from the selected SPS template title intent.\n"
+        "- Use the selected template title wording as a guide, then lightly adapt it to the actual SPS issue facts.\n"
+        "- If multiple SPS categories apply, combine the title smartly so the primary issue remains clear.\n"
+        "- Title part-number logic is based on Issue Part Number(s), not Affected parent part number(s).\n"
+        "- If exactly one Issue Part Number exists, use that Issue P/N in title prefix.\n"
+        "- If more than one Issue Part Number exists, do NOT include any Issue P/N in title.\n"
+        "- If a valid Applied Materials part number is present in the source data, start title with it: <PART_NUMBER> - <short technical title>.\n"
+        "- If NO part number is found in the source data, write the title as plain text WITHOUT any part number prefix.\n"
+        "- Do NOT invent, fabricate, or guess part numbers. Only use part numbers explicitly present in the input.\n"
+        "- Do NOT copy example part numbers, placeholder values, or workbook literals that are not in the current input.\n"
+        "- Do not write the words 'Part Number' in title.\n"
+        "- Do NOT include the part description in the title.\n"
+        "- Title must be clear, complete, and understandable within 85 characters.\n"
+        "- Never include more than one part number in title.\n"
+        "- Self-review the title against the selected SPS template(s) before final output."
+    )
+
+
+def _has_sps_payload(payload: Dict[str, Any]) -> bool:
+    return bool((payload or {}).get("sps_records"))
+
+
+def _build_sps_only_context(payload: Dict[str, Any]) -> str:
+    records = (payload or {}).get("sps_records") or []
+    if not records:
+        return ""
+
+    blocks: List[str] = []
+    for idx, rec in enumerate(records, start=1):
+        problem = (rec.get("problem") or "").strip()
+        solution = (rec.get("solution") or "").strip()
+        part_number = (rec.get("part_number") or "").strip()
+        part_description = (rec.get("part_description") or "").strip()
+
+        lines = [f"SPS Record {idx}:", f"  Supplier-reported issue: {problem}"]
+        if solution:
+            lines.append(f"  Supplier solution: {solution}")
+        if part_number:
+            lines.append(f"  Part Number: {part_number}")
+        if part_description:
+            lines.append(f"  Part Description: {part_description}")
+        blocks.append("\n".join(lines))
+
+    return "\n\n".join(blocks).strip()
 
 # ----------------------------
 # Core Helpers
@@ -964,71 +1232,27 @@ def extract_replacement_pairs(text: str) -> List[Tuple[str, str]]:
     pairs: List[Tuple[str, str]] = []
     seen: set[Tuple[str, str]] = set()
 
-    patterns: List[Tuple[str, int, int]] = [
+    patterns = [
         # "<old> replaced by <new>"
-        (rf"({PN_FRAGMENT})\s*(?:is\s*)?(?:to\s*be\s*)?replaced\s*by\s*({PN_FRAGMENT})", 1, 2),
+        rf"({PN_FRAGMENT})\s*(?:is\s*)?(?:to\s*be\s*)?replaced\s*by\s*({PN_FRAGMENT})",
         # "replace <old> with <new>"
-        (rf"replace\s*({PN_FRAGMENT})\s*with\s*({PN_FRAGMENT})", 1, 2),
+        rf"replace\s*({PN_FRAGMENT})\s*with\s*({PN_FRAGMENT})",
         # "obsolete <old> ... replacement <new>"
-        (rf"obsolete(?:d)?\s*[:=\-]?\s*({PN_FRAGMENT}).*?replacement\s*[:=\-]?\s*({PN_FRAGMENT})", 1, 2),
+        rf"obsolete(?:d)?\s*[:=\-]?\s*({PN_FRAGMENT}).*?replacement\s*[:=\-]?\s*({PN_FRAGMENT})",
         # "from <old> to <new>"
-        (rf"from\s*[:=\-]?\s*({PN_FRAGMENT})\s*to\s*[:=\-]?\s*({PN_FRAGMENT})", 1, 2),
-        # "<old> -> <new>" / ">" / unicode arrow
-        (rf"({PN_FRAGMENT})\s*(?:->|=>|>|\u2192|\u27a1)\s*({PN_FRAGMENT})", 1, 2),
-        # "old applied p/n <old> ... replacement/new p/n <new>"
-        (rf"old\s+(?:applied\s+)?p/?n\s*[:=\-]?\s*({PN_FRAGMENT}).*?(?:replacement|new)\s+(?:applied\s+)?p/?n\s*[:=\-]?\s*({PN_FRAGMENT})", 1, 2),
-        # "replacement/new p/n <new> ... previous/old <old>" (reverse in text)
-        (rf"(?:replacement|new)\s+(?:applied\s+)?p/?n\s*[:=\-]?\s*({PN_FRAGMENT}).*?(?:previous|old)\s+(?:applied\s+)?p/?n\s*[:=\-]?\s*({PN_FRAGMENT})", 2, 1),
-        # Output style support: "Qualified replacement <new> ... Previous <old>"
-        (rf"qualified\s+replacement\s+({PN_FRAGMENT}).*?previous\s+({PN_FRAGMENT})", 2, 1),
+        rf"from\s*[:=\-]?\s*({PN_FRAGMENT})\s*to\s*[:=\-]?\s*({PN_FRAGMENT})",
     ]
 
-    raw_text = str(text)
-    for raw_line in raw_text.splitlines():
+    for raw_line in str(text).splitlines():
         line = raw_line.strip()
         if not line:
             continue
-        for pat, old_idx, new_idx in patterns:
+        for pat in patterns:
             m = re.search(pat, line, flags=re.IGNORECASE)
             if not m:
                 continue
-            old_pn = m.group(old_idx).upper()
-            new_pn = m.group(new_idx).upper()
-            if old_pn != new_pn:
-                pair = (old_pn, new_pn)
-                if pair not in seen:
-                    seen.add(pair)
-                    pairs.append(pair)
-
-    # Multi-line / structured fallback (for JSON-like payload snippets, SPS blocks,
-    # and verbose statements where old/new PNs are not on the same line).
-    structured_patterns: List[Tuple[str, int, int]] = [
-        # JSON payload support: {"obs_part": "<old>", ..., "replacement": "<new>"}
-        (
-            rf"\"(?:obs_part|obsolete(?:_part)?|old_part|obsolete_part_number)\"\s*:\s*\"({PN_FRAGMENT})\""
-            rf".*?\"(?:replacement|replacement_part|new_part|replacement_part_number)\"\s*:\s*\"({PN_FRAGMENT})\"",
-            1,
-            2,
-        ),
-        # Labeled multi-line text: "Old Applied P/N: <old> ... Replacement Part Number: <new>"
-        (
-            rf"old\s+(?:applied\s+)?p/?n\s*[:=\-]?\s*({PN_FRAGMENT})"
-            rf".*?(?:qualified\s+)?replacement\s+(?:part\s+number|p/?n)?\s*[:=\-]?\s*({PN_FRAGMENT})",
-            1,
-            2,
-        ),
-        # Reverse-labeled multi-line text
-        (
-            rf"(?:qualified\s+)?replacement\s+(?:part\s+number|p/?n)?\s*[:=\-]?\s*({PN_FRAGMENT})"
-            rf".*?(?:previous|old)\s+(?:applied\s+)?p/?n\s*[:=\-]?\s*({PN_FRAGMENT})",
-            2,
-            1,
-        ),
-    ]
-    for pat, old_idx, new_idx in structured_patterns:
-        for m in re.finditer(pat, raw_text, flags=re.IGNORECASE | re.DOTALL):
-            old_pn = m.group(old_idx).upper()
-            new_pn = m.group(new_idx).upper()
+            old_pn = m.group(1).upper()
+            new_pn = m.group(2).upper()
             if old_pn != new_pn:
                 pair = (old_pn, new_pn)
                 if pair not in seen:
@@ -1036,76 +1260,6 @@ def extract_replacement_pairs(text: str) -> List[Tuple[str, str]]:
                     pairs.append(pair)
 
     return pairs
-
-
-def _enforce_single_blank_line_between_sections(text: str) -> str:
-    """Ensure exactly one blank line between recognized section headers/blocks."""
-    if not text:
-        return ""
-
-    # 1) Normalize line endings and collapse repeated blank lines to one.
-    lines = str(text).replace("\r\n", "\n").replace("\r", "\n").split("\n")
-    compact: List[str] = []
-    prev_blank = False
-    for ln in lines:
-        is_blank = not ln.strip()
-        if is_blank:
-            if not prev_blank:
-                compact.append("")
-            prev_blank = True
-        else:
-            compact.append(ln.rstrip())
-            prev_blank = False
-
-    header_prefixes = {
-        "title",
-        "problem statement",
-        "change drivers",
-        "esw turn around",
-        "problem description",
-        "impact details",
-        "issue part number(s)",
-        "solution statement",
-        "proposed solution",
-        "solution description",
-        "benefits of the proposed solution",
-    }
-
-    def _is_section_header(line: str) -> bool:
-        s = re.sub(r"^\s*[-*\u2022]\s*", "", line).strip()
-        if not s.endswith(":"):
-            return False
-        base = s[:-1].strip().lower()
-        # Support dynamic headers such as "Change Drivers (PCR# ..., Project# ...):"
-        base = re.sub(r"\s*\([^)]*\)\s*$", "", base).strip()
-        return base in header_prefixes
-
-    # 2) Ensure one blank line before every section header except first non-empty line.
-    out: List[str] = []
-    seen_content = False
-    for ln in compact:
-        if _is_section_header(ln) and seen_content:
-            if out and out[-1] != "":
-                out.append("")
-            elif len(out) >= 2 and out[-1] == "" and out[-2] == "":
-                out.pop()
-        out.append(ln)
-        if ln.strip():
-            seen_content = True
-
-    # Final safety: remove accidental double blanks reintroduced by header handling.
-    final_lines: List[str] = []
-    prev_blank = False
-    for ln in out:
-        if not ln.strip():
-            if not prev_blank:
-                final_lines.append("")
-            prev_blank = True
-        else:
-            final_lines.append(ln)
-            prev_blank = False
-
-    return "\n".join(final_lines).strip()
 
 
 def build_replacement_context(text: str) -> str:
@@ -1147,7 +1301,7 @@ def remove_unwanted_sections(text: str) -> str:
 def _extract_section(text: str, section_name: str) -> str:
     others = [h for h in TOP_LEVEL_SECTION_NAMES if h.lower() != section_name.lower()]
     boundary = "|".join(re.escape(h) for h in others)
-    pattern = rf"^\s*(?:[-*\u2022]\s*)?{re.escape(section_name)}\s*:\s*(.*?)(?=^\s*(?:[-*\u2022]\s*)?(?:{boundary})\s*:|\Z)"
+    pattern = rf"^\s*{re.escape(section_name)}\s*:\s*(.*?)(?=^\s*(?:{boundary})\s*:|\Z)"
     m = re.search(pattern, text, flags=re.IGNORECASE | re.MULTILINE | re.DOTALL)
     return m.group(1).strip() if m else ""
 
@@ -1155,14 +1309,58 @@ def _extract_section(text: str, section_name: str) -> str:
 def _extract_subsection(section_text: str, subsection_name: str, valid_names: List[str]) -> str:
     others = [n for n in valid_names if n.lower() != subsection_name.lower()]
     boundary = "|".join(re.escape(n) for n in others)
-    pattern = rf"^\s*(?:[-*\u2022]\s*)?{re.escape(subsection_name)}\s*:\s*(.*?)(?=^\s*(?:[-*\u2022]\s*)?(?:{boundary})\s*:|\Z)"
+    pattern = rf"^\s*{re.escape(subsection_name)}\s*:\s*(.*?)(?=^\s*(?:{boundary})\s*:|\Z)"
     m = re.search(pattern, section_text, flags=re.IGNORECASE | re.MULTILINE | re.DOTALL)
     return m.group(1).strip() if m else ""
 
 
+def _replace_subsection(
+    section_text: str,
+    subsection_name: str,
+    valid_names: List[str],
+    new_content: str,
+) -> str:
+    if not section_text:
+        return f"{subsection_name}:\n{(new_content or '').strip()}".strip()
+
+    others = [n for n in valid_names if n.lower() != subsection_name.lower()]
+    boundary = "|".join(re.escape(n) for n in others)
+    pattern = rf"^\s*{re.escape(subsection_name)}\s*:\s*(.*?)(?=^\s*(?:{boundary})\s*:|\Z)"
+    replacement = f"{subsection_name}:\n{(new_content or '').strip()}".strip()
+    if re.search(pattern, section_text, flags=re.IGNORECASE | re.MULTILINE | re.DOTALL):
+        return re.sub(
+            pattern,
+            replacement,
+            section_text,
+            count=1,
+            flags=re.IGNORECASE | re.MULTILINE | re.DOTALL,
+        ).strip()
+    return (section_text.rstrip() + "\n\n" + replacement).strip()
+
+
 def _extract_title(text: str) -> str:
-    m = re.search(r"^\s*Title\s*:\s*(.+)$", text, flags=re.IGNORECASE | re.MULTILINE)
-    return m.group(1).strip() if m else ""
+    if not text:
+        return ""
+
+    m = re.search(r"^\s*Title\s*:\s*(.+?)\s*$", text, flags=re.IGNORECASE | re.MULTILINE)
+    if m and m.group(1).strip():
+        return m.group(1).strip()
+
+    hdr = re.search(r"^\s*Title\s*:\s*$", text, flags=re.IGNORECASE | re.MULTILINE)
+    if not hdr:
+        return ""
+
+    tail = text[hdr.end():]
+    for raw in tail.splitlines():
+        line = str(raw or "").strip()
+        if not line:
+            continue
+        if re.match(r"^(Problem\s+Statement|Solution\s+Statement|Proposed\s+Solution|Title)\s*:\s*$", line, flags=re.IGNORECASE):
+            break
+        line = re.sub(r"^[-*•]\s*", "", line).strip()
+        if line:
+            return line
+    return ""
 
 
 def _has_bullet_lines(text: str) -> bool:
@@ -1208,7 +1406,7 @@ def _short_crisp_bullets(text: str, max_bullets: int = 3, max_words: int = 15) -
 
 def _normalize_part_scope_lines(text: str) -> str:
     """
-    For Issue Part Number(s):
+    For Affected Part Numbers / Issue Part Number(s):
     - no repeated 'Part Number:' labels
     - OMS documents (0251-xxxxx) are listed one per line with 'OMS' prefix
     - page numbers in brackets are preserved for OMS items
@@ -1422,41 +1620,6 @@ def _format_from_to_changes(text: str) -> str:
     return "\n".join(result_lines)
 
 
-def _bold_from_to_values(text: str) -> str:
-    """
-    Apply **bold** markers to From: and To: labels and their adjacent values.
-
-    Called as a final post-processing step (after all LLM calls and clean_ai_output runs)
-    so the bold markers are never stripped.
-
-    Handles three patterns:
-    1. Inline 'From: <value> To: <value>' within a sentence (Problem Description bullets).
-    2. Standalone 'From: <value>' line (Solution Description multiline format).
-    3. Standalone 'To: <value>' or 'To   : <value>' label line (produced by _format_from_to_changes).
-    """
-    if not text:
-        return text
-
-    # Case 1: Inline "From: <value> To: <value>" on one line / in one sentence.
-    # "from" value uses lazy match (.+?) stopping before " To:".
-    # "to" value uses greedy non-newline match stopping at sentence terminator.
-    text = re.sub(
-        r'(?im)\bFrom\s*:\s*(.+?)\s+To\s*:\s*([^.;,\n]+)',
-        lambda m: f'**From:** {m.group(1).strip()} **To:** {m.group(2).strip()}',
-        text,
-    )
-
-    # Case 2: Standalone "From: <value>" line (not already bolded by Case 1).
-    # Matches lines that start with optional whitespace then "From:".
-    text = re.sub(r'(?im)^(\s*)From\s*:\s*(.+?)$', r'\1**From:** \2', text)
-
-    # Case 3: Standalone "To: <value>" or "To   : <value>" label line.
-    # "To\s*:" requires a colon after "To", distinguishing it from "To update..." verbs.
-    text = re.sub(r'(?im)^(\s*)To\s*:\s*(.+?)$', r'\1**To:** \2', text)
-
-    return text
-
-
 def _inline_problem_description_from_to(text: str) -> str:
     """
     Ensures From/To change text is part of the Problem Description sentence,
@@ -1667,7 +1830,7 @@ def _build_esw_turnaround_from_payload(payload: Dict[str, Any]) -> str:
     Builds the 'ESW Turn Around (ESW# XXXXX):' section.
     One header per ESW with 1-2 LLM-generated bullets describing temporary workaround context.
     ESW number appears in the section header, not inside the bullets.
-    Include issue part numbers in bullets when they can be inferred from ESW text.
+    Include affected part numbers in bullets when they can be inferred from ESW text.
     """
     esw_records = payload.get("esw_records") or []
     if not esw_records:
@@ -2055,7 +2218,7 @@ def _dedupe_problem_sentences(text: str, max_lines: int = 0) -> str:
         if not ta or not tb:
             return False
         overlap = len(ta & tb) / float(min(len(ta), len(tb)))
-        return overlap >= 0.92
+        return overlap >= 0.8
 
     kept: List[str] = []
     for ln in lines:
@@ -2425,7 +2588,7 @@ def _extract_issue_part_numbers_from_problem(problem_statement: str) -> List[str
 
     Priority:
     1) Issue Part Number(s)
-    2) Issue Part Number(s) fallback when the Issue section is not present.
+    2) Affected/Impacted Part Numbers (fallback when Issue section is not present)
     """
     if not problem_statement:
         return []
@@ -2434,7 +2597,7 @@ def _extract_issue_part_numbers_from_problem(problem_statement: str) -> List[str
     if not issue:
         issue = _extract_subsection(problem_statement, "Issue Part Numbers", PROBLEM_SUBSECTION_NAMES)
     if not issue:
-        issue = ""
+        issue = _extract_subsection(problem_statement, "Affected/Impacted Part Numbers", PROBLEM_SUBSECTION_NAMES)
 
     pns = extract_part_numbers(issue or "")
     seen: set[str] = set()
@@ -2499,13 +2662,16 @@ def validate_engineering_output(output: str, source_text: str) -> List[str]:
         violations.append("Solution Statement section must not be empty.")
 
     if problem:
+        affected = _extract_subsection(problem, "Affected/Impacted Part Numbers", PROBLEM_SUBSECTION_NAMES)
+        if not affected:
+            affected = _extract_subsection(problem, "Affected Part Numbers", PROBLEM_SUBSECTION_NAMES)
         issue_parts = _extract_subsection(problem, "Issue Part Number(s)", PROBLEM_SUBSECTION_NAMES) or \
                       _extract_subsection(problem, "Issue Part Numbers", PROBLEM_SUBSECTION_NAMES)
         problem_desc = _extract_subsection(problem, "Problem Description", PROBLEM_SUBSECTION_NAMES)
         impact = _extract_subsection(problem, "Impact Details", PROBLEM_SUBSECTION_NAMES)
 
-        if not issue_parts:
-            violations.append("Problem Statement must include 'Issue Part Number(s):'.")
+        if not affected and not issue_parts:
+            violations.append("Problem Statement must include part numbers in 'Affected/Impacted Part Numbers:' or 'Affected Part Numbers:'/'Issue Part Number(s):'.")
         if not problem_desc:
             violations.append("Problem Statement must include non-empty 'Problem Description:'.")
         if not impact:
@@ -2521,6 +2687,8 @@ def validate_engineering_output(output: str, source_text: str) -> List[str]:
         if solution_desc and not _has_bullet_lines(solution_desc):
             violations.append("Solution Description must use point-wise bullets with short complete sentences.")
 
+        if re.search(r"\bPart\s*Number\s*:", affected or "", flags=re.IGNORECASE):
+            violations.append("Affected Part Numbers should not repeat 'Part Number:' labels.")
         if re.search(r"\bPart\s*Number\s*:", issue_parts or "", flags=re.IGNORECASE):
             violations.append("Issue Part Number(s) should not repeat 'Part Number:' labels.")
 
@@ -2665,6 +2833,7 @@ def _detect_input_features(user_text: str) -> dict:
     t = user_text.lower()
     has_esw = bool(re.search(r"\besw\s*(?:#|number|num|no\.?)?\s*\d", t, re.IGNORECASE))
     has_oms = bool(re.search(r"\b0251-\d{5}\b", t))
+    has_sps = "sps records from databricks" in t or bool(re.search(r"\bsps\s+\d+", t))
     has_from_to = bool(re.search(r"\bfrom\s*:", t) or re.search(r"\bto\s*:", t))
     has_supply_chain = bool(
         re.search(r"\b(?:on[\-\s]hand|demand|purchase\s+order|p\.?o\.?\s*#|shortage|inventory|coverage)\b", t)
@@ -2678,6 +2847,7 @@ def _detect_input_features(user_text: str) -> dict:
     return {
         "has_esw": has_esw,
         "has_oms": has_oms,
+        "has_sps": has_sps,
         "has_from_to": has_from_to,
         "has_supply_chain": has_supply_chain,
         "has_eol_obsolete": has_eol_obsolete,
@@ -2687,14 +2857,16 @@ def _detect_input_features(user_text: str) -> dict:
 
 def _build_engineering_prompt(user_text: str, supply_chain_scenario: bool = False) -> str:
     features = _detect_input_features(user_text)
-    selected_category, approved_title_label = _select_problem_category_and_title_label(
-        user_text,
-        supply_chain_scenario=supply_chain_scenario,
-    )
-    selected_taxonomy_block = _build_selected_taxonomy_prompt_block(
-        selected_category,
-        approved_title_label,
-    )
+    selected_taxonomy_block = ""
+    if not features["has_sps"]:
+        selected_category, approved_title_label = _select_problem_category_and_title_label(
+            user_text,
+            supply_chain_scenario=supply_chain_scenario,
+        )
+        selected_taxonomy_block = _build_selected_taxonomy_prompt_block(
+            selected_category,
+            approved_title_label,
+        )
 
     # Pre-select best SC statement once (used in both suppression section and sc_rules).
     _sc_triggered = features["has_supply_chain"] or supply_chain_scenario
@@ -2707,11 +2879,7 @@ def _build_engineering_prompt(user_text: str, supply_chain_scenario: bool = Fals
     from_to_section = f"\n{_FROM_TO_FORMAT_RULES}\n" if features["has_from_to"] else ""
     oms_problem_section = f"\n{_OMS_DOMAIN_RULES}\n" if features["has_oms"] else ""
     oms_solution_grouping = f"\n{_OMS_GROUPING_RULES}\n" if features["has_oms"] else ""
-    problem_grouping_section = (
-        f"\n{_PROBLEM_GROUPING_RULES}\n"
-        if (features["has_from_to"] or features["has_eol_obsolete"])
-        else ""
-    )
+    sps_template_section = f"\n{_build_sps_template_prompt_block(user_text)}\n" if features["has_sps"] else ""
     sc_suppression_section = (
         "\nSUPPLY CHAIN INVENTORY / DEMAND / PO NUMBER SUPPRESSION (MANDATORY):\n"
         "- NEVER reproduce specific inventory quantities, demand figures, PO numbers,"
@@ -2741,7 +2909,7 @@ def _build_engineering_prompt(user_text: str, supply_chain_scenario: bool = Fals
             "  - Any supply status timestamp (e.g., 'as of 09 Apr 2025')\n\n"
             "MANDATORY for Problem Description - use EXACTLY this statement verbatim:\n"
             f"  \"{_sc_text}\"\n"
-            "  Pair with the issue part number(s). Do NOT invent new phrasing.\n\n"
+            "  Pair with the affected part number(s). Do NOT invent new phrasing.\n\n"
             "MANDATORY for Solution Description:\n"
             "  - Use general corrective/escalation language only.\n"
             "  - Examples: supply acceleration, demand review, alternative sourcing evaluation,\n"
@@ -2755,6 +2923,26 @@ def _build_engineering_prompt(user_text: str, supply_chain_scenario: bool = Fals
             "These items are SUPPRESSED and MUST NOT appear in your output. Use ONLY the approved\n"
             f"generic supply chain criticality statement provided in the rules above.\n\n"
         )
+    title_rules = _build_sps_title_rules() if features["has_sps"] else (
+        "TITLE:\n"
+        "- MANDATORY: Use the pre-selected approved title label above as the core of the title.\n"
+        "- Format: <PART_NUMBER> - <Approved Title Label>\n"
+        "- Example: if approved title label is 'Missing Tolerance on DWG', title = 'NNNN-NNNNN - Missing Tolerance on DWG'\n"
+        "- Example: if approved title label is 'OEM EOL Declaration - Replacement P/N Not Yet Identified', title = 'NNNN-NNNNN - OEM EOL Declaration - Replacement P/N Not Yet Identified'\n"
+        "- Copy the approved title label verbatim. Do NOT paraphrase it.\n"
+        "- Short and technical.\n"
+        "- Title part-number logic is based on Issue Part Number(s), not Affected parent part number(s).\n"
+        "- If exactly one Issue Part Number exists, use that Issue P/N in title prefix.\n"
+        "- If more than one Issue Part Number exists, do NOT include any Issue P/N in title.\n"
+        "- If a valid Applied Materials part number is present in the source data, start title with it: <PART_NUMBER> - <short technical title>\n"
+        "- If NO part number is found in the source data, write the title as plain text WITHOUT any part number prefix.\n"
+        "- Do NOT invent, fabricate, or guess part numbers. Only use part numbers explicitly present in the input.\n"
+        "- Do not write the words 'Part Number' in title.\n"
+        "- Do NOT include the part description (e.g. item name such as 'RING, FOCUS' or 'SCREW, M6') in the title. The title after the part number must describe the engineering issue or change, not the part name.\n"
+        "- Title must be clear, complete, and understandable within 85 characters.\n"
+        "- Never include more than one part number in title.\n"
+        "- If the title would look clipped, incomplete, or unclear with a part number prefix, remove part number(s) and output a clear plain-language title."
+    )
     return f"""
 You are acting as a senior manufacturing engineer preparing an ECR/ECN problem description.
 Rewrite the provided content into a clearly formatted, professional, and audit-ready Engineering Problem Description.
@@ -2780,9 +2968,10 @@ STRICT RULES:
 - SUPPLIER / MANUFACTURER PART NUMBERS (MANDATORY): If any supplier-assigned or manufacturer part numbers are present in the input (PCR, Project, or SPS records), they MUST be explicitly referenced by their part number in either the Problem Description or Solution Description. Do not omit or paraphrase manufacturer part numbers.
 - SOURCE FIELD MAPPING — strictly observe which input fields feed which output section:
     - Problem Statement draws ONLY from: 'Problem:', 'Supplier-reported issue:', 'Defined Scope (Problem Basis):', 'Key Objective:' fields.
-    - Solution Statement draws ONLY from: 'Solution:', 'Supporting Solution/Change:', 'Supplier-proposed change:', 'Deliverables (Solution Basis):', 'Proposed Solution from Email:', 'User Proposed Solution:' fields.
+    - Solution Statement draws ONLY from: 'Solution:', 'Supporting Solution/Change:', 'Supplier solution:', 'Supplier-proposed change:', 'Deliverables (Solution Basis):', 'Proposed Solution from Email:', 'User Proposed Solution:' fields.
     - NEVER copy a Solution/Proposed Change field value into Problem Statement.
     - NEVER copy a Problem/Issue field value into Solution Statement.
+    - SPS SPECIAL RULE: when SPS records exist, use only 'Supplier-reported issue:' and 'Supplier solution:' from SPS records for template selection and drafting. Ignore any SPS proposed solution field.
 - SYNTHESIS — when input contains multiple records (PCR, Project, SPS, ESW), synthesize their combined intent into ONE unified Problem Description and ONE unified Solution Description. Do NOT produce separate paragraphs or blocks per record. Identify the shared engineering objective across all records and express it as a single coherent statement.
 - Understand and use engineering relationships when available in input:
   - BOM structure (Parent/Child part relationship; Child reports to Parent).
@@ -2796,24 +2985,9 @@ STRICT RULES:
 
 {selected_taxonomy_block}
 
-TITLE:
-- MANDATORY: Use the pre-selected approved title label above as the core of the title.
-- Format: <PART_NUMBER> - <Approved Title Label>
-- Example: if approved title label is "Missing Tolerance on DWG", title = "NNNN-NNNNN - Missing Tolerance on DWG"
-- Example: if approved title label is "OEM EOL Declaration - Replacement P/N Not Yet Identified", title = "NNNN-NNNNN - OEM EOL Declaration - Replacement P/N Not Yet Identified"
-- Copy the approved title label verbatim. Do NOT paraphrase it.
-- Short and technical.
-- Title part-number logic is based on Issue Part Number(s), not Affected parent part number(s).
-- If exactly one Issue Part Number exists, use that Issue P/N in title prefix.
-- If more than one Issue Part Number exists, do NOT include any Issue P/N in title.
-- If a valid Applied Materials part number is present in the source data, start title with it: <PART_NUMBER> - <short technical title>
-- If NO part number is found in the source data, write the title as plain text WITHOUT any part number prefix.
-- Do NOT invent, fabricate, or guess part numbers. Only use part numbers explicitly present in the input.
-- Do not write the words "Part Number" in title.
-- Do NOT include the part description (e.g. item name such as "RING, FOCUS" or "SCREW, M6") in the title. The title after the part number must describe the engineering issue or change, not the part name.
-- Title must be clear, complete, and understandable within 85 characters.
-- Never include more than one part number in title.
-- If the title would look clipped, incomplete, or unclear with a part number prefix, remove part number(s) and output a clear plain-language title.
+{sps_template_section}
+
+{title_rules}
 
 PROBLEM STATEMENT:
 Must include exact subsection order:
@@ -2835,10 +3009,35 @@ Change Drivers:
       (e.g. "we are able to purchase" becomes "Supplier is able to procure",
              "we cannot get" becomes "Supplier is unable to procure").
     - Describe the issue in professional third-person language WITHOUT citing any SPS number.
-    - If SPS records contain Part Number and Part Description fields, include those part numbers in Issue Part Number(s).
+    - If SPS records contain Part Number and Part Description fields, include those part numbers in the Affected/Impacted Part Numbers or Issue Part Number(s) section as applicable.
   SPS# PROHIBITION (MANDATORY): Do NOT write any SPS number anywhere in the output — not in Change Drivers, Problem Description, Solution Statement, or any other section.
 
-Issue Part Number(s):
+ Affected/Impacted Part Numbers (use this header if Affected and Issue are same):
+ - List only Applied Materials part numbers found in the input.
+ - AM part number format: 4-5 digits, hyphen, exactly 5 digits (e.g. NNNN-NNNNN or ESWNNN-NNNNN where N is a digit).
+ - Do NOT invent, guess, or use example/placeholder part numbers. Only copy part numbers explicitly present in the source input.
+ - If no AM part number is found in the input, write only: -
+ - Do not include SPS IDs, PCR IDs, Project IDs, QN IDs, or supplier/manufacturer part numbers.
+ - If multiple part numbers exist, list as comma-separated values on one line.
+ - Do NOT repeat "Part Number:" label in this subsection.
+ - CRITICAL LOGIC FOR PART DESCRIPTIONS:
+     * If exactly ONE part number is identified in ALL input records combined:
+         - AND that part number has a description shown in the input (from SPS records labeled "Part Number: X" and "Part Description: Y"):
+         - THEN include the description: <PART_NUMBER> - <Part Description>
+         - Example: 0042-90060 - RING, FOCUS
+     * If TWO OR MORE part numbers exist anywhere in the input: List part numbers ONLY, no descriptions.
+     * If ONE part number exists but NO description found: List part number ONLY, no description.
+
+Affected Part Numbers (use this header only if different from Issue):
+- List only Applied Materials part numbers found in the input. No descriptions.
+- AM part number format: 4-5 digits, hyphen, exactly 5 digits (e.g. NNNN-NNNNN or ESWNNN-NNNNN where N is a digit).
+- Do NOT invent, guess, or use example/placeholder part numbers. Only copy part numbers explicitly present in the source input.
+- If no AM part number is found in the input, write only: -
+- Do not include SPS IDs, PCR IDs, Project IDs, QN IDs, or supplier/manufacturer part numbers.
+- If similar scope has multiple part numbers, list as comma-separated values on one line.
+- Do NOT repeat "Part Number:" label in this subsection.
+
+Issue Part Number(s) (use this header only if different from Affected):
 - List only issue-causing Applied Materials part numbers found in the input.
 - Issue Part Number(s) must be the child part number(s) that carry the issue.
 - AM part number format: 4-5 digits, hyphen, exactly 5 digits (e.g. NNNN-NNNNN or ESWNNN-NNNNN where N is a digit).
@@ -2856,39 +3055,37 @@ Issue Part Number(s):
     * If TWO OR MORE part numbers exist anywhere in the input: List part numbers ONLY, no descriptions.
     * If ONE part number exists but NO description found: List part number ONLY, no description.
 
-Issue Part Number(s) Relationship Rule:
+Affected Part Number(s) and Issue Part Number(s) Relationship Rule:
+- If BOM parent/child context exists, set Affected Part Number(s) to parent part number(s).
 - If BOM parent/child context exists, set Issue Part Number(s) to child issue part number(s).
 - Do not leave Issue Part Number(s) blank when an issue-carrying child part number is present.
 
 Problem Description:
-- COMPLETE COVERAGE (MANDATORY): Every distinct fact, change, or issue in the source input MUST appear as a bullet in Problem Description. Do NOT summarize, compress, or omit any source content. Use as many bullets as needed to cover the full problem statement.
 - SOURCE-BOUND ONLY: every bullet must be directly traceable to an explicit statement in the input. Do NOT assume, infer, expand, generalise, or add best-practice language.
 - DESCRIBE ONLY WHAT IS MISSING, INCORRECT, OR NOT DOCUMENTED. Do NOT include actions, fixes, decisions, buyoff conclusions, agreed values, or any information that implies a resolution.
 - Do NOT reword a problem into a solution.
 - Do NOT mention buyoff conclusions, agreed values, communicated values, or confirmed requirements — those belong in Solution Description only.
 - Each bullet must be a single, complete sentence written entirely on one line. Never continue or split a sentence onto the next line.
-- SENTENCE LENGTH: Each bullet should be easy to read and understand. Prefer short, direct sentences. If a bullet becomes long or chained, split it into multiple clear bullets.
+- SENTENCE LENGTH (MANDATORY): Each bullet must be short and direct — maximum 15 words. If a bullet exceeds 15 words, split into sub-bullets or compress.
 - Use factual/descriptive language (e.g., "does not specify", "is incorrect", "is missing", "is undefined", "is not documented").
 - Do NOT use action/solution verbs such as Update, Specify, Define, Add note, Revise, Clarify — those belong in Solution Description only.
 - No paragraphs; bullet points only.
-- For supplier-driven multi-change inputs, use short in-section labels when clearly present in source (for example: Reason for Change:, Software Changes:, Hardware Changes:, Component Changes:).
-- Keep one clear idea per bullet. Do NOT chain multiple clauses into one long bullet.
 - Do NOT include any "Reason Code" text in Problem Description.
-- PART NUMBER DESCRIPTIONS IN BRACKETS: When a part number alone would be unclear, you MAY add a short description in brackets after it for clarity. Example: 'GA1068 (Gate Array)'. Keep descriptions short (1-3 words). Do NOT add descriptions for well-known Applied Materials part numbers (NNNN-NNNNN format).
+- PART NUMBERS ONLY — NO DESCRIPTIONS: Write part numbers alone (e.g., 3310-00443). Do NOT append any part name, description, or parenthetical text after a part number anywhere in Problem Description or Impact Details. WRONG: '3310-00443 (2 INCH INDICATING PRESSURE TRANSMITTER)'. RIGHT: '3310-00443'.
 - If BOM Parent/Child is present, state the relationship concisely.
 - If SPS records provide issue P/N(s), make Problem Description primarily about issue P/N(s).
 - Always include supplier name in Problem Description.
 - Parent reporting/where-used chain may be mentioned in ONE bullet only.
 - Do NOT create multiple bullets describing parent hierarchy; use remaining bullets for issue details.
-- If obsolete/EOL is present, write that supplier/OEM obsoleted the supplier MPN impacting the Issue P/N.
+- If obsolete/EOL is present, write that the Issue P/N is declared obsolete; do NOT state parent P/N obsolete.
 - Mention parent structuring as the 2nd bullet in Problem Description.
 - Mention only first-level parent relation. Do NOT include second-level parent chains.
-- When supplier MPN exists, format obsolete statement as: Supplier P/N <MPN> obsolete impacting Applied <Commodity Class> P/N <AM P/N>.
+- When supplier MPN exists, format obsolete statement as: Applied <Commodity Class> P/N <AM P/N> (Supplier P/N <MPN>).
 - In obsolete/EOL cases, include first-level parent in the same obsolete bullet.
 - Include commodity class label (for example, OEM) with Applied part number where applicable.
 - If obsolete/replacement mapping is present, state which part is obsolete and which replaces it.
 - In Problem Description, do NOT mention identified replacement part number details; replacements belong to Solution Description.
-- NO BULLET LIMIT: Use as many bullets as needed to cover every source fact completely. Do NOT compress or omit facts to meet a bullet count.
+- Maximum 6 bullets. If output exceeds 6 or repeats information, rewrite and compress.
 - If any sentence contains BOTH a problem AND a solution: move it entirely to Solution Description and rewrite the problem bullet to describe only the missing/incorrect aspect.
 - If information is insufficient, omit it completely. Do NOT compensate by adding assumed best practices.
 
@@ -2907,7 +3104,7 @@ CONTEXT ANCHORING AND DE-DUPLICATION (MANDATORY):
     "The required tightening torque is not specified."
 - If "Assy DWG" or the part number appears in more than one bullet (in single-SPS mode), the output is INVALID — rewrite and consolidate into a single anchor bullet.
 - Combine all DWG/part-number-anchored issues into the first bullet wherever possible.
-{problem_grouping_section}
+
 Impact Details:
 - 2 to 3 short, crisp bullets only.
 - Max ~15 words per bullet.
@@ -2929,27 +3126,21 @@ Solution Description:
 - SEMANTIC DEDUPLICATION (MANDATORY): Do NOT create multiple bullets that express the same corrective action in different words. Keep only the most specific, direct statement.
 - SPS# PROHIBITION (MANDATORY): SPS# must NEVER appear anywhere in the Solution Statement — not in Solution Description, Benefits, or any other subsection. Do not write "per SPS#", "per SPS", or any SPS number reference anywhere in the solution.
 - No paragraphs; bullet points and indented sub-bullets only.
-- SENTENCE LENGTH (MANDATORY): Each top-level bullet must be short, direct, and complete with natural sentence length (prefer up to about 22 words). Do NOT chain multiple actions using ' - ' dashes or semicolons within a single bullet. One bullet = one action verb + one target. If an action has multiple sub-items, use indented sub-bullets.
+- SENTENCE LENGTH (MANDATORY): Each top-level bullet must be short, direct, and complete — maximum 15 words. Do NOT chain multiple actions using ' - ' dashes or semicolons within a single bullet. One bullet = one action verb + one target. If an action has multiple sub-items, use indented sub-bullets.
 - PART NUMBERS ONLY — NO DESCRIPTIONS: Write part numbers alone (e.g., 0090-09868). Do NOT append any part name, description, or parenthetical text after a part number anywhere in Solution Description. WRONG: '0090-09868 (Assy, IPT122 PRESSURE TRANSMITTER, B)'. RIGHT: '0090-09868'.
 - If BOM Parent/Child is present, describe the required BOM/document change concisely.
 - If obsolete/replacement mapping is present, state the replacement action using that mapping.
-- If source explicitly states obsolete/replacement mapping (for example, "X replaced with Y"), include that exact mapping in Solution Description.
 - OBSOLESCENCE CASE (MANDATORY):
     - If replacement is identified, include:
-        - Bullet 1: supplier-obsoleted MPN context and proposed replacement for impacted Applied P/N.
-        - Bullet 2: Applied Materials qualified and approved proposed replacement.
-        - Bullet 3: "Qualified replacement Part is meeting form-fit-function (FFF) requirements."
-        - Bullet 4: Per interchangeability affected parents are revised or obsolete if FFF impacted.
+        - Bullet 1: replacement Applied P/N and Supplier P/N in brackets for obsolete Applied P/N.
+        - Bullet 2: "Qualify the Proposed/Identified replacement Part that meeting form-fit-function (FFF) requirements."
+        - Bullet 3: check parent interchangeability and revise parent if interchangeable, or obsolete if FFF impacted.
     - If replacement is not identified, include:
-        - "Supplier reported MPN obsolescence; Applied Materials to identify and qualify alternate replacement."
+        - "Identify and qualify an alternate part / supplier meeting form-fit-function (FFF) requirements."
         - "Perform required engineering validation and testing (fitment, performance, reliability)."
         - Update all relevant documentation: Parents, BOM, Drawings, Specifications, Work instructions.
-
-- SUPPLIER/OEM CONTEXT (MANDATORY):
-    - For OEM Applied P/N records, preserve supplier Alias ID, MPN, and TDS details when available.
-    - Supplier hierarchy terms may be used when present in source: Tier 1, Tier 2, OEM supplier.
-    - Never state that supplier obsoleted Applied P/N directly.
 - If "Proposed Solution from Email:" or "User Proposed Solution:" is provided, refine and integrate it here.
+- Maximum 6 top-level bullets. If output exceeds 6 or repeats information, rewrite and compress.
 - If information is insufficient, omit it completely. Do NOT compensate by adding assumed best practices.
 {oms_solution_grouping}
 
@@ -2994,9 +3185,11 @@ Title:
 
 Problem Statement:
 Change Drivers:      (include when reference records exist)
+Affected/Impacted Part Numbers:  (use when Affected and Issue are same)
+Affected Part Number(s):            (use when different)
+Issue Part Number(s):             (use when different)
 Problem Description:
 Impact Details:
-Issue Part Number(s):
 
 Solution Statement:
 Solution Description:
@@ -3009,42 +3202,207 @@ INPUT:
 """.strip()
 
 
-def reframe_problem(user_text: str, supply_chain_scenario: bool = False):
-
-    # ✅ Step 1: Preprocess raw SPS input
-    user_text = preprocess_sps_text(user_text)
-
-    # ✅ Step 2: Ensure Solution exists
-    if "Solution:" not in user_text:
-        matches = re.findall(r"propose.*", user_text, re.IGNORECASE)
-        if matches:
-            solution_text = "\n".join(matches)
-            user_text += "\n\nSolution:\n- " + solution_text
-
-    # ✅ Step 3: Add Change Drivers if missing (SPS-only case)
-    if "Change Drivers:" not in user_text:
-        user_text += (
-            "\n\nChange Drivers:\n"
-            "- This change is to drive supply continuity due to supplier constraint.\n"
-            "- This change is to drive temporary substitution until source stabilization."
-        )
-
-    # ✅ Step 4: Call your existing prompt logic
-    prompt = _build_engineering_prompt(
-        user_text,
-        supply_chain_scenario=supply_chain_scenario
-    )
-
+def reframe_problem(user_text: str, supply_chain_scenario: bool = False) -> str:
+    prompt = _build_engineering_prompt(user_text, supply_chain_scenario)
     draft = _call_databricks(prompt)
-
     if draft.startswith("Error:"):
         return draft
 
-    # ✅ Step 5: Clean output
     draft = clean_ai_output(draft)
     draft = remove_unwanted_sections(draft)
+    draft = _remove_supplier_rev_tokens(draft)
+
+    # Apply low-cost deterministic cleanup before any second pass.
+    draft = re.sub(r"\bSPS\s*#?\s*\d+\b", "", draft, flags=re.IGNORECASE)
+    if supply_chain_scenario:
+        draft = _sanitize_supply_chain_numbers(draft)
+
+    def _critical_violations(items: List[str]) -> List[str]:
+        return [
+            v for v in items
+            if any(kw in v for kw in ("SPS", "Missing", "must not be empty"))
+        ]
+
+    violations = validate_engineering_output(draft, user_text)
+    critical_violations = _critical_violations(violations)
+
+    if not critical_violations:
+        return draft
+
+    # Lightweight deterministic normalization pass (no extra LLM call).
+    title = _normalize_title_with_part_number(_extract_title(draft).strip(), user_text)
+    problem_section = _extract_section(draft, "Problem Statement").strip()
+    solution_section = _extract_section(draft, "Solution Statement").strip() or _extract_section(draft, "Proposed Solution").strip()
+
+    normalized_problem = _normalize_problem_statement(problem_section, user_text)
+    normalized_solution = _normalize_solution_statement(solution_section, user_text)
+    deterministic = (
+        f"Title:\n{title}\n\n"
+        f"Problem Statement:\n{normalized_problem}\n\n"
+        f"Solution Statement:\n{normalized_solution}"
+    ).strip()
+    deterministic = clean_ai_output(deterministic)
+    deterministic = remove_unwanted_sections(deterministic)
+    deterministic = _remove_supplier_rev_tokens(deterministic)
+    deterministic = re.sub(r"\bSPS\s*#?\s*\d+\b", "", deterministic, flags=re.IGNORECASE)
+    if supply_chain_scenario:
+        deterministic = _sanitize_supply_chain_numbers(deterministic)
+
+    deterministic_violations = validate_engineering_output(deterministic, user_text)
+    deterministic_critical = _critical_violations(deterministic_violations)
+    if len(deterministic_critical) < len(critical_violations):
+        draft = deterministic
+        critical_violations = deterministic_critical
+
+    # Short corrective prompt fallback only when critical violations remain.
+    if critical_violations:
+        fix_prompt = f"""
+Fix only these violations in the current draft:
+
+- {"\n- ".join(critical_violations)}
+
+Return the full corrected output using only these top-level headers:
+Title:
+Problem Statement:
+Solution Statement:
+
+Do not add explanations. Preserve existing valid content and edit minimally.
+
+Current draft:
+{draft}
+""".strip()
+        revised = _call_databricks(fix_prompt)
+        if not revised.startswith("Error:"):
+            revised = clean_ai_output(revised)
+            revised = remove_unwanted_sections(revised)
+            revised = _remove_supplier_rev_tokens(revised)
+            revised = re.sub(r"\bSPS\s*#?\s*\d+\b", "", revised, flags=re.IGNORECASE)
+            if supply_chain_scenario:
+                revised = _sanitize_supply_chain_numbers(revised)
+
+            revised_violations = validate_engineering_output(revised, user_text)
+            revised_critical = _critical_violations(revised_violations)
+            if len(revised_critical) <= len(critical_violations):
+                draft = revised
 
     return draft
+
+
+def _review_sps_template_alignment(
+    title: str,
+    problem_statement: str,
+    solution_statement: str,
+    source_text: str,
+    payload: Dict[str, Any],
+) -> Tuple[str, str, str]:
+    if not _has_sps_payload(payload):
+        return title, problem_statement, solution_statement
+
+    current_problem_desc = _extract_subsection(problem_statement, "Problem Description", PROBLEM_SUBSECTION_NAMES)
+    current_solution_desc = _extract_subsection(solution_statement, "Solution Description", SOLUTION_SUBSECTION_NAMES)
+    if not current_problem_desc or not current_solution_desc:
+        return title, problem_statement, solution_statement
+
+    sps_context = _build_sps_only_context(payload)
+    if not sps_context:
+        return title, problem_statement, solution_statement
+
+    prompt = f"""
+You are reviewing an SPS-driven ECR draft.
+
+Task:
+1. Classify the SPS content into Main Group, Sub Group, and Sub Sub Category using ONLY the SPS records below.
+2. Use ONLY SPS 'Supplier-reported issue' and SPS 'Supplier solution' fields for template selection and wording.
+3. Ignore any SPS proposed solution field entirely.
+4. Review the current Title, Problem Description, and Solution Description against the SPS template catalog.
+5. Rewrite only these three sections so they better follow the selected SPS template(s).
+6. Preserve the existing intent of Change Drivers, ESW Turn Around, Impact Details, Benefits, and part-number sections.
+7. If multiple SPS categories apply, blend the matching templates.
+8. If no exact SPS category matches, keep the same structured template style as the closest catalog entry.
+9. Never copy example part numbers, suppliers, MPNs, or placeholders unless they appear in the current SPS input.
+10. Do NOT mention SPS numbers anywhere.
+
+Return EXACTLY this format only:
+Title:
+<reviewed title>
+
+Problem Description:
+<reviewed problem bullets>
+
+Solution Description:
+<reviewed solution bullets>
+
+SPS RECORDS:
+<<<
+{sps_context}
+>>>
+
+SPS TEMPLATE CATALOG:
+{_build_sps_template_prompt_block(sps_context)}
+
+CURRENT DRAFT:
+Title:
+{title}
+
+Problem Description:
+{current_problem_desc}
+
+Solution Description:
+{current_solution_desc}
+""".strip()
+
+    revised = _call_databricks(prompt)
+    if not revised or revised.startswith("Error:"):
+        return title, problem_statement, solution_statement
+
+    revised = clean_ai_output(revised)
+    revised = _remove_supplier_rev_tokens(revised)
+    revised = re.sub(r"\bSPS\s*#?\s*\d+\b", "", revised, flags=re.IGNORECASE)
+
+    reviewed_title = _extract_title(revised).strip() or title
+    review_subsections = ["Problem Description", "Solution Description"]
+    reviewed_problem_desc = _extract_subsection(revised, "Problem Description", review_subsections).strip()
+    reviewed_solution_desc = _extract_subsection(revised, "Solution Description", review_subsections).strip()
+    if not reviewed_problem_desc or not reviewed_solution_desc:
+        return title, problem_statement, solution_statement
+
+    reviewed_problem_desc = _normalize_bullets(reviewed_problem_desc)
+    reviewed_problem_desc = _dedupe_sps_in_bullets(reviewed_problem_desc)
+    reviewed_problem_desc = _reframe_long_problem_bullets(reviewed_problem_desc, max_words=15)
+    reviewed_problem_desc = _complete_dangling_bullets(
+        reviewed_problem_desc,
+        source_text,
+        max_words=15,
+        imperative=False,
+    )
+    reviewed_problem_desc = _dedupe_bullet_block(reviewed_problem_desc)
+
+    reviewed_solution_desc = _normalize_bullets(reviewed_solution_desc)
+    reviewed_solution_desc = _split_inline_dashes_to_bullets(reviewed_solution_desc)
+    reviewed_solution_desc = _dedupe_sps_in_bullets(reviewed_solution_desc)
+    reviewed_solution_desc = _reframe_long_solution_bullets(reviewed_solution_desc, max_words=15)
+    reviewed_solution_desc = _complete_dangling_bullets(
+        reviewed_solution_desc,
+        source_text,
+        max_words=15,
+        imperative=True,
+    )
+    reviewed_solution_desc = _dedupe_bullet_block(reviewed_solution_desc)
+
+    updated_problem = _replace_subsection(
+        problem_statement,
+        "Problem Description",
+        PROBLEM_SUBSECTION_NAMES,
+        reviewed_problem_desc,
+    )
+    updated_solution = _replace_subsection(
+        solution_statement,
+        "Solution Description",
+        SOLUTION_SUBSECTION_NAMES,
+        reviewed_solution_desc,
+    )
+    reviewed_title = _normalize_title_with_part_number(reviewed_title, source_text)
+    return reviewed_title, updated_problem, updated_solution
 
 def _any_tab_checked(payload: Dict[str, Any]) -> bool:
     flags = payload.get("include_tabs_flags") or {}
@@ -3198,21 +3556,12 @@ def _compose_user_text(payload: Dict[str, Any]) -> str:
             part_number = (rec.get("part_number") or "").strip()
             part_description = (rec.get("part_description") or "").strip()
             problem = (rec.get("problem") or "").strip()
-            # Both proposed_solution (sps_problem.problem_soultion) and solution
-            # (sps_solution.solution) may contain distinct, non-overlapping content.
-            # Concatenate both so neither is silently dropped.
-            proposed_sol = (rec.get("proposed_solution") or "").strip()
-            extra_sol = (rec.get("solution") or "").strip()
-            if proposed_sol and extra_sol and proposed_sol != extra_sol:
-                combined_solution = proposed_sol + "\n  " + extra_sol
-            elif proposed_sol:
-                combined_solution = proposed_sol
-            else:
-                combined_solution = extra_sol
+            # SPS template logic uses only SPS Problem and SPS Solution fields.
+            supplier_solution = (rec.get("solution") or "").strip()
             entry = (
-                f"SPS {sps_id} (Status: {status}) — SUPPLIER COMMUNICATION TO APPLIED MATERIALS:\n"
+                f"SPS {sps_id} (Status: {status}) - SUPPLIER COMMUNICATION TO APPLIED MATERIALS:\n"
                 f"  Supplier-reported issue: {problem}\n"
-                f"  Supplier-proposed change: {combined_solution}"
+                f"  Supplier solution: {supplier_solution}"
             )
             if part_number:
                 entry += f"\n  Part Number: {part_number}"
@@ -3220,7 +3569,7 @@ def _compose_user_text(payload: Dict[str, Any]) -> str:
                 entry += f"\n  Part Description: {part_description}"
             lines.append(entry)
         chunks.append(
-            "SPS Records from Databricks (raw supplier voice — translate all first-person to third-person; treat as supplier-to-AM communication):\n\n"
+            "SPS Records from Databricks (raw supplier voice - translate all first-person to third-person; treat as supplier-to-AM communication):\n\n"
             + "\n\n".join(lines)
         )
 
@@ -3298,7 +3647,7 @@ def _build_bom_context_from_where_used(source_text: str) -> str:
 
     Returns a formatted string compatible with ``extract_bom_relationships()``
     so that ``_derive_part_sections_from_bom`` can automatically assign the
-    correct parent to Issue Part Number(s) where applicable and child to Issue Part Number(s).
+    correct parent to Affected Part Numbers and child to Issue Part Numbers.
 
     Returns an empty string when:
     - fewer than two part numbers are present in source_text
@@ -3485,7 +3834,7 @@ def _rewrite_bullets_to_imperative(problem_desc: str, source_text: str = "") -> 
         "immediately after the part number. "
         "WRONG: 'P/N 3310-00443 (2 INCH INDICATING PRESSURE TRANSMITTER)' "
         "RIGHT: 'P/N 3310-00443'.\n"
-        "13. SENTENCE LENGTH: Each output line must be short, direct, and complete — prefer up to about 22 words. "
+        "13. SENTENCE LENGTH: Each output line must be short, direct, and complete — maximum 15 words. "
         "If an input bullet is too long or chains multiple actions with ' - ' dashes or "
         "semicolons, split it into separate output lines (one per action).\n\n"
         "PROBLEM DESCRIPTION BULLETS:\n"
@@ -3527,6 +3876,9 @@ def _normalize_problem_statement(problem_section: str, source_text: str = "") ->
     if not problem_section:
         return ""
 
+    affected = _extract_subsection(problem_section, "Affected/Impacted Part Numbers", PROBLEM_SUBSECTION_NAMES)
+    if not affected:
+        affected = _extract_subsection(problem_section, "Affected Part Numbers", PROBLEM_SUBSECTION_NAMES)
     issue_parts = _extract_subsection(problem_section, "Issue Part Number(s)", PROBLEM_SUBSECTION_NAMES)
     if not issue_parts:
         issue_parts = _extract_subsection(problem_section, "Issue Part Numbers", PROBLEM_SUBSECTION_NAMES)
@@ -3546,7 +3898,7 @@ def _normalize_problem_statement(problem_section: str, source_text: str = "") ->
         problem_desc,
     )
     problem_desc = _remove_known_part_descriptions(problem_desc, source_text, remove_standalone=True)
-    problem_desc = _break_long_sentences(problem_desc, max_length=220, max_words=22)
+    problem_desc = _break_long_sentences(problem_desc, max_length=180, max_words=15)
     problem_desc = _linebreak_after_fullstop(problem_desc)
     problem_desc = _inline_problem_description_from_to(problem_desc)
     problem_desc = _dedupe_problem_sentences(problem_desc, max_lines=0)
@@ -3554,40 +3906,73 @@ def _normalize_problem_statement(problem_section: str, source_text: str = "") ->
     problem_desc = _dedupe_sps_in_bullets(problem_desc)
     problem_desc = _group_repeated_bullets(problem_desc)
     problem_desc = _reorganize_problem_bullets(problem_desc)
-    problem_desc = _rewrite_problem_bullets_from_source(problem_desc, source_text)
     problem_desc = _limit_parent_reporting_bullets(problem_desc)
     problem_desc = _enforce_issue_parent_bullet_style(problem_desc, issue_parts, source_text)
+    problem_desc = _reframe_long_problem_bullets(problem_desc, max_words=15)
+    problem_desc = _complete_dangling_bullets(problem_desc, source_text, max_words=15, imperative=False)
     problem_desc = _dedupe_bullet_block(problem_desc)
 
+    normalized_affected = _normalize_multiline_list(affected) if affected else ""
     normalized_issue = _normalize_multiline_list(issue_parts) if issue_parts else ""
 
     # SPS-specific enforcement:
     # 1) Issue Part Number(s): always use SPS issue part number(s) with description.
+    # 2) Affected Part Number(s): query where-used in Databricks and use parent part number(s).
     sps_issue_desc_map = _extract_sps_issue_part_descriptions(source_text)
     sps_issue_pns = _unique_preserve(list(sps_issue_desc_map.keys()))
+    sps_parent_pns: List[str] = []
     if sps_issue_pns:
         normalized_issue = "\n".join(
             f"{pn} - {sps_issue_desc_map[pn]}" if sps_issue_desc_map.get(pn) else pn
             for pn in sps_issue_pns
+        )
+        sps_parent_pns = _lookup_parent_parts_from_where_used(sps_issue_pns, max_level=1)
+        if sps_parent_pns:
+            normalized_affected = ", ".join(sps_parent_pns)
+
+    normalized_affected, normalized_issue = _derive_part_sections_from_bom(
+        normalized_affected,
+        normalized_issue,
+        source_text,
+    )
+
+    # Second pass: if Affected or Issue is still blank, read the generated
+    # problem_desc for narrative BOM clues (e.g. "BOM of X calls for Y").
+    if not extract_part_numbers(normalized_affected) or not extract_part_numbers(normalized_issue):
+        normalized_affected, normalized_issue = _derive_part_sections_from_bom(
+            normalized_affected,
+            normalized_issue,
+            source_text,
+            narrative_text=problem_desc,
         )
 
-    # Re-assert SPS-specific Issue section after any generic normalization.
+    # Re-assert SPS-specific Issue and Affected sections after BOM derivation.
     if sps_issue_pns:
         normalized_issue = "\n".join(
             f"{pn} - {sps_issue_desc_map[pn]}" if sps_issue_desc_map.get(pn) else pn
             for pn in sps_issue_pns
         )
+        if sps_parent_pns:
+            normalized_affected = ", ".join(sps_parent_pns)
+
+    normalized_affected = _inject_single_part_description(normalized_affected, source_text)
     normalized_issue = _inject_single_part_description(normalized_issue, source_text)
 
+    affected_pns = extract_part_numbers(normalized_affected)
     issue_pns = extract_part_numbers(normalized_issue)
+    same_parts = bool(affected_pns and issue_pns and set(affected_pns) == set(issue_pns))
 
     blocks: List[str] = []
+    if same_parts:
+        blocks.append("Affected/Impacted Part Numbers:\n" + (normalized_affected or "-"))
+    else:
+        blocks.append("Affected Part Number(s):\n" + (normalized_affected or "-"))
+        blocks.append("Issue Part Number(s):\n" + (normalized_issue or "-"))
     if problem_desc:
         blocks.append("Problem Description:\n" + problem_desc.strip())
     if impact_details:
         impact_details = _compress_repeated_part_number_labels(impact_details)
         blocks.append("Impact Details:\n" + _normalize_bullets(impact_details, crisp=True))
-    blocks.append("Issue Part Number(s):\n" + (normalized_issue or "-"))
 
     return "\n\n".join(blocks).strip()
 
@@ -4204,56 +4589,6 @@ def _reorganize_problem_bullets(text: str) -> str:
     return result.strip()
 
 
-def _rewrite_problem_bullets_from_source(problem_desc: str, source_text: str = "") -> str:
-    """Rewrite Problem Description bullets into concise, source-bound statements.
-
-    CRITICAL: Every fact from the source must appear in the output.
-    Use as many bullets as needed. Do not compress or drop content.
-    """
-    if not problem_desc or not problem_desc.strip():
-        return problem_desc
-
-    prompt = (
-        "You are a senior manufacturing engineer rewriting a Problem Description for ECR documentation.\n\n"
-        "TASK: Rewrite the problem bullets below into clear, easy-to-understand bullets.\n\n"
-        "RULES:\n"
-        "1. COMPLETE COVERAGE: Every factual issue from the source MUST appear as a bullet. Do NOT omit any fact.\n"
-        "2. Use as many bullets as needed to cover the full source content. There is NO bullet count limit.\n"
-        "3. Do NOT copy long prose verbatim. Reconstruct it into clear, simple bullets.\n"
-        "4. Each bullet must be one complete, easy-to-understand sentence.\n"
-        "5. Use only issue language: missing, incorrect, not documented, obsolete, inconsistent, changed, or affected.\n"
-        "6. Do NOT introduce solution language, generic recommendations, or assumptions.\n"
-        "7. Do NOT use SPS numbers. Do NOT repeat the same idea in multiple bullets.\n"
-        "8. Preserve part numbers and supplier names exactly when present.\n"
-        "9. When a supplier or manufacturer part number alone would be unclear, add a short description in brackets. Example: GA1068 (Gate Array), HCPL-0710-500ME (Photocoupler).\n"
-        "10. For multi-change inputs covering software, hardware, connectors, PCB etc., organize bullets by category using short labels like Software Changes:, Hardware Changes:, Component Changes:.\n"
-        "11. Output ONLY bullets, one per line, starting with '- '. No header or explanation.\n\n"
-        "PROBLEM BULLETS TO REWRITE:\n"
-        f"{problem_desc.strip()}\n\n"
-        "SOURCE CONTEXT (for accuracy only — use it to verify completeness):\n"
-        f"{(source_text or '').strip()[:4000]}"
-    )
-
-    result = _call_databricks(prompt)
-    if not result or result.startswith("Error:"):
-        return problem_desc
-
-    lines: List[str] = []
-    for raw in result.strip().splitlines():
-        ln = raw.strip()
-        ln = re.sub(r"^[-*•]\s*", "", ln)
-        if not ln:
-            continue
-        lines.append(f"- {ln}")
-
-    if not lines:
-        return problem_desc
-
-    out = "\n".join(lines)
-    out = _split_inline_dashes_to_bullets(out)
-    return _dedupe_bullet_block(out)
-
-
 def _limit_parent_reporting_bullets(text: str) -> str:
     """Keep parent-reporting context in at most one top-level bullet.
 
@@ -4293,20 +4628,12 @@ def _limit_parent_reporting_bullets(text: str) -> str:
     if len(parent_bullets) <= 1:
         return text
 
-    # Keep all parent bullets that mention DIFFERENT part numbers.
-    seen_parent_pns: set = set()
-    unique_parent_bullets: List[str] = []
-    for pb in parent_bullets:
-        pns = set(extract_part_numbers(pb))
-        if pns and pns <= seen_parent_pns:
-            continue  # same parts already covered
-        seen_parent_pns |= pns
-        unique_parent_bullets.append(pb)
-    if not unique_parent_bullets:
-        unique_parent_bullets = [parent_bullets[0]]
-
-    rebuilt: List[str] = list(unique_parent_bullets)
+    rebuilt: List[str] = [parent_bullets[0]]
     rebuilt.extend(issue_bullets)
+
+    # If everything was parent-centric, keep one fallback bullet to avoid empty issue section.
+    if not issue_bullets and len(parent_bullets) > 1:
+        rebuilt.append(parent_bullets[1])
 
     return "\n".join(rebuilt)
 
@@ -4379,10 +4706,6 @@ def _commodity_class_label(part_number: str) -> str:
     if not m:
         return ""
     code = int(m.group(1))
-    if code == 15:
-        return "Modified OEM"
-    if code == 195:
-        return "Spec Controlled OEM"
     if code >= 500:
         return "OEM"
     return ""
@@ -4459,19 +4782,19 @@ def _enforce_issue_parent_bullet_style(problem_desc: str, issue_text: str, sourc
             continue
 
         if issue_pn and obsolete_pat.search(x):
-            # Force supplier-MPN obsolescence style with commodity + parent in same bullet.
+            # Force issue P/N obsolete statement style with commodity + parent in same bullet.
             prefix = f"Applied {commodity_label} P/N" if commodity_label else "Applied P/N"
             if supplier_mpn and first_level_parent:
                 x = (
-                    f"{supplier_name} declared Supplier P/N {supplier_mpn} obsolete for {prefix} {issue_pn}, "
-                    f"which is a child component of Assy. {first_level_parent}."
+                    f"{supplier_name} has obsoleted {prefix} {issue_pn} (Supplier P/N {supplier_mpn}), "
+                    f"and is a child component of Assy. {first_level_parent}."
                 )
             elif supplier_mpn:
-                x = f"{supplier_name} declared Supplier P/N {supplier_mpn} obsolete for {prefix} {issue_pn}."
+                x = f"{supplier_name} has obsoleted {prefix} {issue_pn} (Supplier P/N {supplier_mpn})."
             elif first_level_parent:
-                x = f"{supplier_name} reported OEM obsolescence impacting {prefix} {issue_pn}, a child of Assy. {first_level_parent}."
+                x = f"{supplier_name} has obsoleted {prefix} {issue_pn}, and is a child component of Assy. {first_level_parent}."
             else:
-                x = f"{supplier_name} reported OEM obsolescence impacting {prefix} {issue_pn}."
+                x = f"{supplier_name} has obsoleted {prefix} {issue_pn}."
 
         if issue_pn and first_level_parent and parent_pat.search(x) and not obsolete_pat.search(x):
             if supplier_mpn:
@@ -4548,10 +4871,10 @@ def _normalize_solution_statement(solution_section: str, source_text: str = "") 
     merged_solution_desc = _dedupe_sps_in_bullets(merged_solution_desc)
     # Final safety-net: ensure no chained bullets remain in the assembled output.
     merged_solution_desc = _split_inline_dashes_to_bullets(merged_solution_desc)
-    # LLM reframe: shorten any top-level bullet that still becomes too long.
-    merged_solution_desc = _reframe_long_solution_bullets(merged_solution_desc, max_words=22)
+    # LLM reframe: shorten any top-level bullet still exceeding 15 words.
+    merged_solution_desc = _reframe_long_solution_bullets(merged_solution_desc, max_words=15)
     # Repair incomplete/truncated bullets ending with dangling prepositions.
-    merged_solution_desc = _complete_dangling_bullets(merged_solution_desc, source_text, max_words=22, imperative=True)
+    merged_solution_desc = _complete_dangling_bullets(merged_solution_desc, source_text, max_words=15, imperative=True)
     merged_solution_desc = _dedupe_bullet_block(merged_solution_desc)
 
     blocks: List[str] = []
@@ -4590,238 +4913,6 @@ def _source_has_explicit_solution(payload: Dict[str, Any]) -> bool:
             if str(rec.get("immediate_corrective_action") or "").strip():
                 return True
     return False
-
-
-def _normalize_source_block_text(text: str) -> str:
-    if not text:
-        return ""
-    lines = [ln.rstrip() for ln in str(text).splitlines()]
-    # Preserve original line-level content while collapsing excessive blank groups.
-    joined = "\n".join(lines).strip()
-    joined = re.sub(r"\n{3,}", "\n\n", joined)
-    return joined
-
-
-def _collect_complete_problem_entries(payload: Dict[str, Any]) -> List[Tuple[str, str]]:
-    entries: List[Tuple[str, str]] = []
-
-    for rec in payload.get("sps_records") or []:
-        src_id = str(rec.get("sps_id") or rec.get("ec_number") or "").strip() or "Unknown"
-        problem = _normalize_source_block_text(rec.get("problem") or "")
-        if problem:
-            entries.append((f"SPS {src_id}", problem))
-
-    for rec in payload.get("pcr_records") or []:
-        src_id = str(rec.get("pcr_id") or "").strip() or "Unknown"
-        problem = _normalize_source_block_text(rec.get("problem") or "")
-        if problem:
-            entries.append((f"PCR {src_id}", problem))
-
-    for rec in payload.get("project_records") or []:
-        src_id = str(rec.get("project_id") or "").strip() or "Unknown"
-        problem = _normalize_source_block_text(rec.get("defined_scope") or rec.get("project_name") or "")
-        if problem:
-            entries.append((f"Project {src_id}", problem))
-
-    for rec in payload.get("esw_records") or []:
-        src_id = str(rec.get("ec_number") or rec.get("esw_number") or "").strip() or "Unknown"
-        problem = _normalize_source_block_text(rec.get("problem") or rec.get("title") or "")
-        if problem:
-            entries.append((f"ESW {src_id}", problem))
-
-    for rec in payload.get("qn_records") or []:
-        src_id = str(rec.get("ec_number") or rec.get("qn_number") or "").strip() or "Unknown"
-        problem = _normalize_source_block_text(rec.get("problem") or rec.get("title") or "")
-        if problem:
-            entries.append((f"QN {src_id}", problem))
-
-    current_problem = _normalize_source_block_text(payload.get("current_problem_text") or "")
-    if current_problem:
-        entries.append(("User Input", current_problem))
-
-    return entries
-
-
-def _collect_complete_solution_entries(payload: Dict[str, Any]) -> List[Tuple[str, str]]:
-    entries: List[Tuple[str, str]] = []
-
-    for rec in payload.get("sps_records") or []:
-        src_id = str(rec.get("sps_id") or rec.get("ec_number") or "").strip() or "Unknown"
-        parts = [
-            _normalize_source_block_text(rec.get("proposed_solution") or ""),
-            _normalize_source_block_text(rec.get("solution") or ""),
-        ]
-        merged = "\n".join([p for p in parts if p]).strip()
-        if merged:
-            entries.append((f"SPS {src_id}", merged))
-
-    for rec in payload.get("pcr_records") or []:
-        src_id = str(rec.get("pcr_id") or "").strip() or "Unknown"
-        solution = _normalize_source_block_text(rec.get("solution") or "")
-        if solution:
-            entries.append((f"PCR {src_id}", solution))
-
-    for rec in payload.get("project_records") or []:
-        src_id = str(rec.get("project_id") or "").strip() or "Unknown"
-        solution = _normalize_source_block_text(rec.get("deliverables") or "")
-        if solution:
-            entries.append((f"Project {src_id}", solution))
-
-    for rec in payload.get("esw_records") or []:
-        src_id = str(rec.get("ec_number") or rec.get("esw_number") or "").strip() or "Unknown"
-        solution = _normalize_source_block_text(rec.get("solution") or rec.get("proposed_solution") or "")
-        if solution:
-            entries.append((f"ESW {src_id}", solution))
-
-    for rec in payload.get("qn_records") or []:
-        src_id = str(rec.get("ec_number") or rec.get("qn_number") or "").strip() or "Unknown"
-        solution = _normalize_source_block_text(rec.get("solution") or rec.get("proposed_solution") or "")
-        if solution:
-            entries.append((f"QN {src_id}", solution))
-
-    current_solution = _normalize_source_block_text(
-        payload.get("current_solution_text")
-        or payload.get("proposed_solution_text")
-        or ""
-    )
-    if current_solution:
-        entries.append(("User Input", current_solution))
-
-    return entries
-
-
-def _infer_solution_input_files(payload: Dict[str, Any]) -> List[str]:
-    labels: List[str] = []
-    if payload.get("sps_records"):
-        labels.append("SPS")
-    if payload.get("pcr_records"):
-        labels.append("PCR")
-    if payload.get("project_records"):
-        labels.append("Project")
-    if payload.get("esw_records"):
-        labels.append("ESW")
-    if payload.get("qn_records"):
-        labels.append("QN")
-
-    if not labels:
-        labels = ["SPS", "PCR", "Project", "ESW", "QN"]
-    return labels
-
-
-def _extract_alternate_equivalent_parts(solution_text: str, primary_replacement: str) -> List[str]:
-    if not solution_text:
-        return []
-    alternates: List[str] = []
-    for raw in str(solution_text).splitlines():
-        line = raw.strip()
-        if not line:
-            continue
-        if not re.search(r"\b(alternate|alternative|equivalent|equiv\.?|substitute|interchangeable|drop[-\s]?in)\b", line, flags=re.IGNORECASE):
-            continue
-        for pn in extract_part_numbers(line):
-            if pn != primary_replacement and pn not in alternates:
-                alternates.append(pn)
-    return alternates
-
-
-def _extract_supporting_reasoning(solution_text: str) -> List[str]:
-    if not solution_text:
-        return []
-    reasons: List[str] = []
-    for raw in str(solution_text).splitlines():
-        line = raw.strip()
-        if not line:
-            continue
-        if re.search(r"\b(due to|because|to address|to avoid|to mitigate|to ensure|pending|therefore|hence|reason|rationale|eol|obsolete)\b", line, flags=re.IGNORECASE):
-            if line not in reasons:
-                reasons.append(line)
-    return reasons
-
-
-def _build_complete_problem_description(payload: Dict[str, Any]) -> str:
-    entries = _collect_complete_problem_entries(payload)
-    if not entries:
-        return ""
-
-    merged = "\n".join(text for _, text in entries if text).strip()
-    if not merged:
-        return ""
-    cleaned = _normalize_bullets(merged)
-    cleaned = _dedupe_bullet_block(cleaned)
-    if not cleaned:
-        return ""
-    return "Problem Description:\n" + cleaned
-
-
-def _replace_problem_description(problem_statement: str, new_problem_desc: str) -> str:
-    if not new_problem_desc:
-        return problem_statement
-
-    if not problem_statement:
-        return "Problem Description:\n" + new_problem_desc
-
-    pattern = re.compile(
-        r"(^\s*Problem\s+Description\s*:\s*)(.*?)(?=^\s*Impact\s+Details\s*:|\Z)",
-        flags=re.IGNORECASE | re.MULTILINE | re.DOTALL,
-    )
-    if pattern.search(problem_statement):
-        return pattern.sub(lambda m: m.group(1) + new_problem_desc + "\n", problem_statement)
-
-    return problem_statement.strip() + "\n\nProblem Description:\n" + new_problem_desc
-
-
-def _build_complete_solution_statement(payload: Dict[str, Any], existing_solution: str = "") -> str:
-    entries = _collect_complete_solution_entries(payload)
-    if not entries:
-        file_labels = ", ".join(_infer_solution_input_files(payload))
-        missing_msg = (
-            "- No solution found in input files. "
-            f"Please update solution in the input file(s): {file_labels}."
-        )
-        return "Solution Description:\n" + missing_msg
-
-    source_solution_text = "\n".join(text for _, text in entries if text).strip()
-    source_solution_desc = _normalize_bullets(source_solution_text)
-    source_solution_desc = _split_inline_dashes_to_bullets(source_solution_desc)
-    source_solution_desc = _rewrite_bullets_to_imperative(source_solution_desc, source_solution_text)
-    source_solution_desc = _split_inline_dashes_to_bullets(source_solution_desc)
-    source_solution_desc = _dedupe_bullet_block(source_solution_desc)
-
-    existing_solution_desc = _extract_subsection(existing_solution, "Solution Description", SOLUTION_SUBSECTION_NAMES)
-    if not existing_solution_desc:
-        existing_solution_desc = existing_solution.strip()
-    merged_solution_desc = _normalize_bullets(existing_solution_desc)
-    merged_solution_desc = _split_inline_dashes_to_bullets(merged_solution_desc)
-    merged_solution_desc = _dedupe_bullet_block(merged_solution_desc)
-
-    # Keep LLM-reframed output as primary when available, but backfill from source if needed.
-    final_solution_desc = merged_solution_desc or source_solution_desc
-
-    # Preserve explicit source replacement mappings so critical part swaps are never dropped.
-    replacement_pairs = extract_replacement_pairs(source_solution_text)
-    for obsolete_pn, replacement_pn in replacement_pairs:
-        if not obsolete_pn or not replacement_pn:
-            continue
-        if re.search(rf"\b{re.escape(obsolete_pn)}\b", final_solution_desc, flags=re.IGNORECASE) and re.search(
-            rf"\b{re.escape(replacement_pn)}\b",
-            final_solution_desc,
-            flags=re.IGNORECASE,
-        ):
-            continue
-        replacement_line = f"- Replace {obsolete_pn} with {replacement_pn}."
-        final_solution_desc = (replacement_line + "\n" + final_solution_desc).strip() if final_solution_desc else replacement_line
-
-    final_solution_desc = _dedupe_bullet_block(final_solution_desc)
-
-    blocks: List[str] = []
-    if final_solution_desc:
-        blocks.append("Solution Description:\n" + final_solution_desc)
-
-    benefits = _extract_subsection(existing_solution, "Benefits of the Proposed Solution", SOLUTION_SUBSECTION_NAMES)
-    if benefits:
-        blocks.append("Benefits of the Proposed Solution:\n" + _normalize_bullets(benefits, crisp=True))
-
-    return "\n\n".join(blocks).strip()
 
 
 def _looks_like_solution_bullet(line: str) -> bool:
@@ -4964,6 +5055,10 @@ def _rebalance_problem_solution(
             flags=re.IGNORECASE | re.MULTILINE | re.DOTALL,
         )
         esw_turnaround = m_esw.group(1).strip() if m_esw else ""
+    aff_imp = _extract_subsection(normalized_problem, "Affected/Impacted Part Numbers", PROBLEM_SUBSECTION_NAMES)
+    aff = _extract_subsection(normalized_problem, "Affected Part Number(s)", PROBLEM_SUBSECTION_NAMES)
+    if not aff:
+        aff = _extract_subsection(normalized_problem, "Affected Part Numbers", PROBLEM_SUBSECTION_NAMES)
     issue = _extract_subsection(normalized_problem, "Issue Part Number(s)", PROBLEM_SUBSECTION_NAMES)
     if not issue:
         issue = _extract_subsection(normalized_problem, "Issue Part Numbers", PROBLEM_SUBSECTION_NAMES)
@@ -4974,6 +5069,11 @@ def _rebalance_problem_solution(
         rebuilt_problem_blocks.append(change_drivers_header + "\n" + ref.strip())
     if esw_turnaround:
         rebuilt_problem_blocks.append(esw_turnaround_header + "\n" + _normalize_bullets(esw_turnaround, crisp=True))
+    if aff_imp:
+        rebuilt_problem_blocks.append("Affected/Impacted Part Numbers:\n" + aff_imp.strip())
+    else:
+        rebuilt_problem_blocks.append("Affected Part Number(s):\n" + ((aff or "-").strip() or "-"))
+        rebuilt_problem_blocks.append("Issue Part Number(s):\n" + ((issue or "-").strip() or "-"))
 
     if not kept and original_lines:
         # Keep one line to avoid an empty Problem Description section.
@@ -4983,7 +5083,6 @@ def _rebalance_problem_solution(
     rebuilt_problem_blocks.append("Problem Description:\n" + kept_desc.strip())
     if impact:
         rebuilt_problem_blocks.append("Impact Details:\n" + _normalize_bullets(impact, crisp=True))
-    rebuilt_problem_blocks.append("Issue Part Number(s):\n" + ((issue or "-").strip() or "-"))
     rebuilt_problem = "\n\n".join(rebuilt_problem_blocks).strip()
 
     # Merge moved bullets into Solution Description.
@@ -4997,9 +5096,9 @@ def _rebalance_problem_solution(
     merged_solution = _split_inline_dashes_to_bullets(merged_solution)
     # Strip any part descriptions the LLM may have re-introduced after rewriting.
     merged_solution = _remove_known_part_descriptions(merged_solution, source_text, remove_standalone=False)
-    # LLM reframe: shorten any top-level bullet that still becomes too long.
-    merged_solution = _reframe_long_solution_bullets(merged_solution, max_words=22)
-    merged_solution = _complete_dangling_bullets(merged_solution, source_text, max_words=22, imperative=True)
+    # LLM reframe: shorten any top-level bullet still exceeding 15 words.
+    merged_solution = _reframe_long_solution_bullets(merged_solution, max_words=15)
+    merged_solution = _complete_dangling_bullets(merged_solution, source_text, max_words=15, imperative=True)
 
     rebuilt_solution_blocks: List[str] = []
     if merged_solution:
@@ -5018,14 +5117,13 @@ def _enforce_obsolescence_solution_style(
 ) -> str:
     """Enforce user-required obsolescence Solution Description bullet patterns.
 
-        - If replacement is identified:
-            1) Mention supplier-obsoleted MPN context and proposed replacement for impacted Applied P/N.
-            2) State Applied Materials review/approval or alternate-identification responsibility.
-            3) Check parent interchangeability; revise parent if interchangeable, or obsolete if FFF impacted.
-        - If replacement is not identified:
-            1) State supplier MPN obsolescence and Applied Materials alternate-identification responsibility.
-            2) Revise/obsolete parents per interchangeability policy and FFF impact.
-            3) Communicate approved/identified replacement planning with supplier.
+    - If replacement is identified:
+      1) Mention identified replacement for obsolete Applied P/N.
+      2) Check parent interchangeability; revise parent if interchangeable, or obsolete if FFF impacted.
+    - If replacement is not identified:
+      1) Identify/qualify replacement for OBS part.
+      2) Revise/obsolete parents per interchangeability policy and FFF impact.
+      3) Communicate replacement part to supplier.
     """
     if not solution_statement or not solution_statement.strip():
         return solution_statement
@@ -5040,88 +5138,44 @@ def _enforce_obsolescence_solution_style(
     issue_pns = _extract_issue_part_numbers_from_problem(problem_statement)
     issue_pn = issue_pns[0] if issue_pns else ""
 
-    # Detect replacement mappings from both the normalized source text and
-    # the current solution statement so explicit pairs are never missed.
     pairs = extract_replacement_pairs(source_text)
-    stmt_pairs = extract_replacement_pairs(solution_statement)
-    all_pairs: List[Tuple[str, str]] = []
-    for old_pn, new_pn in pairs + stmt_pairs:
-        if not old_pn or not new_pn:
-            continue
-        pair = (old_pn.upper(), new_pn.upper())
-        if pair not in all_pairs:
-            all_pairs.append(pair)
-
-    old_applied_pn = ""
     replacement_pn = ""
-    if all_pairs:
+    if pairs:
         if issue_pn:
-            for old_pn, new_pn in all_pairs:
+            for old_pn, new_pn in pairs:
                 if old_pn.upper() == issue_pn.upper():
-                    old_applied_pn = old_pn
                     replacement_pn = new_pn
                     break
         if not replacement_pn:
-            old_applied_pn, replacement_pn = all_pairs[0]
-    if not old_applied_pn:
-        old_applied_pn = issue_pn
+            replacement_pn = pairs[0][1]
 
-    # -------------------------------------------------------------------
-    # Fallback: if extract_replacement_pairs found nothing, scan the full
-    # solution statement (including Benefits the LLM already wrote) for
-    # any AM part number that is explicitly labeled as a "Replacement" and
-    # differs from the issue PN.  The LLM often correctly identifies the
-    # replacement in Benefits even when the source text format does not
-    # match any deterministic pair-extraction pattern.
-    # -------------------------------------------------------------------
-    if not replacement_pn:
-        _all_solution_pns = extract_part_numbers(solution_statement)
-        _issue_pn_set = {p.upper() for p in issue_pns}
-        # Also collect all PNs already present in the problem statement so
-        # we do not accidentally pick an affected-parent as replacement.
-        _problem_pns_set = {p.upper() for p in extract_part_numbers(problem_statement)}
-
-        # Strategy 1: Look for "Replacement P/N <PN>" or "Replacement <PN>"
-        _repl_m = re.findall(
-            rf"replacement\s+(?:P/?N\s+)?({PN_FRAGMENT})",
-            solution_statement,
-            flags=re.IGNORECASE,
-        )
-        for _candidate in _repl_m:
-            _cu = _candidate.upper()
-            if _cu not in _issue_pn_set and _cu not in _problem_pns_set:
-                replacement_pn = _cu
-                break
-
-        # Strategy 2: Pick any AM PN in solution that is not in problem/issue
-        if not replacement_pn:
-            for _sp in _all_solution_pns:
-                _su = _sp.upper()
-                if _su not in _issue_pn_set and _su not in _problem_pns_set:
-                    replacement_pn = _su
-                    break
-
-        if replacement_pn:
-            old_applied_pn = issue_pn or old_applied_pn
-
-    # Explicit replacement pair mapping always wins over textual "no replacement"
-    # phrases that may exist in historical/source narrative.
-    has_replacement = bool(replacement_pn)
+    no_replacement = any(k in lower for k in [
+        "no replacement", "replacement not identified", "not yet identified",
+        "no approved replacement", "replacement not communicated",
+    ])
+    has_replacement = bool(replacement_pn) and not no_replacement
+    replacement_supplier_mpn = _extract_supplier_mpn_for_part(source_text, replacement_pn) if replacement_pn else ""
 
     benefits = _extract_subsection(solution_statement, "Benefits of the Proposed Solution", SOLUTION_SUBSECTION_NAMES)
 
     if has_replacement:
-        lead_issue = old_applied_pn or issue_pn or "the previous Applied P/N"
+        lead_issue = issue_pn or pairs[0][0]
+        if replacement_supplier_mpn:
+            repl_line = (
+                f"- Replacement {replacement_pn} (Supplier P/N {replacement_supplier_mpn}) "
+                f"is identified for obsolete Applied P/N {lead_issue}."
+            )
+        else:
+            repl_line = f"- Replacement {replacement_pn} is identified for obsolete Applied P/N {lead_issue}."
         bullets = [
-            f"- Applied Materials has Qualified replacement {replacement_pn} as an alternate to Previous {lead_issue}.",
-            f"- Obsolete {lead_issue} and replace it with Qualified replacement {replacement_pn}.",
-            f"- Apply interchangeability policy to impacted parent structure for obsolete Applied P/N {lead_issue}.",
+            repl_line,
+            "- Qualify the proposed/identified replacement part meeting form-fit-function (FFF) requirements.",
+            "- Check parent interchangeability and revise parent if interchangeable, or obsolete if FFF impacted.",
         ]
     else:
-        lead_issue = issue_pn or (all_pairs[0][0] if all_pairs else "the OBS part")
+        lead_issue = issue_pn or (pairs[0][0] if pairs else "the OBS part")
         bullets = [
-            f"- Replacement for Applied P/N {lead_issue} not found in input files.",
-            "- Applied Materials must identify and qualify an alternate part meeting form-fit-function (FFF) requirements.",
+            "- Identify and qualify an alternate part / supplier meeting form-fit-function (FFF) requirements.",
             "- Perform required engineering validation and testing (fitment, performance, reliability).",
             "- Update all relevant documentation:",
             "  - BOM",
@@ -5147,6 +5201,7 @@ def _sc_shortage_deterministic_fallback(part_numbers: List[str], lead_pn: str) -
     pn_ref = f"for part number {pn_str}" if part_numbers else "for the affected part"
     title = f"{lead_pn + ' - ' if lead_pn else ''}Supply Chain Criticality"
     problem = (
+        f"Affected/Impacted Part Numbers:\n{pn_str}\n\n"
         "Problem Description:\n"
         f"- Critical Inventory Status: The supplier currently has no on-hand inventory {pn_ref},"
         " resulting in an immediate supply risk with no buffer available.\n"
@@ -5159,9 +5214,7 @@ def _sc_shortage_deterministic_fallback(part_numbers: List[str], lead_pn: str) -
         "Impact Details:\n"
         "- Supply constraints may affect production plans and customer commitments.\n"
         "- No buffer exists to absorb forecast changes or unexpected demand increases.\n"
-        "- Downstream delivery risk increases without immediate corrective action.\n\n"
-        "Issue Part Number(s):\n"
-        f"{pn_str}"
+        "- Downstream delivery risk increases without immediate corrective action."
     )
     solution = (
         "Solution Description:\n"
@@ -5177,8 +5230,8 @@ def _sc_shortage_deterministic_fallback(part_numbers: List[str], lead_pn: str) -
     )
     return {
         "title": title[:85],
-        "problem_statement": problem,
-        "solution_statement": solution,
+        "problem_statement": problem[:4000],
+        "solution_statement": solution[:4000],
         "raw": "",
     }
 
@@ -5259,34 +5312,34 @@ ABSOLUTE RULES — ZERO EXCEPTIONS — VIOLATIONS WILL INVALIDATE THE ENTIRE OUT
 7. ALWAYS reference the part number(s) listed below in your output.
 8. Do NOT invent facts, supplier commitments, or new information beyond what is stated in Scenario Context.
 
-ISSUE PART NUMBER(S): {pn_list}
+AFFECTED PART NUMBER(S): {pn_list}
 {(chr(10) + scenario_context) if scenario_context else ""}
 
 APPROVED SUPPLY CHAIN CRITICALITY STATEMENT — USE VERBATIM IN PROBLEM DESCRIPTION:
   - {_sc_selected_stmt}
-    Pair with the issue part number(s). Use this statement exactly as written.
+  Pair with the affected part number(s). Use this statement exactly as written.
 
 APPROVED SOLUTION ACTIONS — USE 2 TO 4 IN SOLUTION DESCRIPTION:
-    - Initiate cross-functional supply chain escalation for the issue part number(s).
+  - Initiate cross-functional supply chain escalation for the affected part number(s).
   - Engage supplier to accelerate inbound supply and provide an updated delivery commitment.
-    - Evaluate alternative sourcing options or qualified alternate suppliers for the issue part number(s).
+  - Evaluate alternative sourcing options or qualified alternate suppliers for the affected part number(s).
   - Implement demand smoothing measures to prioritize coverage for critical production plans.
   - Establish enhanced monitoring cadence until sustainable inventory levels are restored.
-    - Treat the issue part number(s) as critical items until forward coverage is re-established.{eol_solution_actions}
+  - Treat the affected part number(s) as critical items until forward coverage is re-established.{eol_solution_actions}
 
 OUTPUT FORMAT — use EXACTLY these headers, no deviations:
 Title:
 {default_title}
 
-    "Problem Statement:\n"
-    "Problem Description:\n"
-    "<3 to 5 bullet points — use ONLY approved generic statements above — always reference the part number(s) — NO quantities, NO PO numbers, NO dates>\n"
+Problem Statement:
+Affected/Impacted Part Numbers:
+{pn_list}
 
-    "Impact Details:\n"
-    "<2 to 3 short bullets on operational/business risk — NO numbers>\n\n"
+Problem Description:
+<3 to 5 bullet points — use ONLY approved generic statements above — always reference the part number(s) — NO quantities, NO PO numbers, NO dates>
 
-    "Issue Part Number(s):\n"
-    f"{pn_list}\n"
+Impact Details:
+<2 to 3 short bullets on operational/business risk — NO numbers>
 
 Solution Statement:
 Solution Description:
@@ -5326,128 +5379,285 @@ Use ONLY the exact approved statements listed above. Do NOT add new sentences th
 
     # Ensure part numbers are present in the output
     if part_numbers and not any(pn in problem_section for pn in part_numbers):
-        problem_section = f"{problem_section}\n\nIssue Part Number(s):\n{pn_list}"
+        problem_section = f"Affected/Impacted Part Numbers:\n{pn_list}\n\n" + problem_section
 
     return {
         "title": title,
-        "problem_statement": problem_section,
-        "solution_statement": solution_section,
+        "problem_statement": problem_section[:4000],
+        "solution_statement": solution_section[:4000],
         "raw": drafted[:12000],
     }
 
 
+def _clean_raw_sps_text(text: str) -> str:
+    """Strip raw SPS prefixes and noisy tokens from fallback text."""
+    if not text:
+        return text
+    t = str(text)
+    # Strip leading "REMARKS:" or "Remark:" prefix
+    t = re.sub(r"^\s*REMARKS?\s*:\s*", "", t, flags=re.IGNORECASE)
+    # Strip priority tokens like "pri-1 (Urgent)" or "Priority: 1"
+    t = re.sub(r"\bpri-?\d+\s*\(?\w*\)?\s*", "", t, flags=re.IGNORECASE)
+    # Strip "Customer Part#" → just keep the part number
+    t = re.sub(r"\bCustomer\s+Part\s*#?\s*", "", t, flags=re.IGNORECASE)
+    # Strip internal supplier codes like "(19011000@LAPP)"
+    t = re.sub(r"\(\d+@\w+\)", "", t)
+    # Normalize whitespace
+    t = re.sub(r"  +", " ", t).strip()
+    return t
 
-def _regroup_problem_description(problem_text: str, source_text: str = "") -> str:
-    """
-    PLM Final Step: Groups similar items in Problem Description by change category.
 
-    Reads the already-written Problem Description, checks for grouping possibilities
-    (multiple supplier-driven changes spanning different component/firmware/hardware categories),
-    and rewrites the content grouped under numbered category headers.
+def _collect_fallback_problem_text(payload: Dict[str, Any], source_text: str) -> str:
+    parts: List[str] = []
 
-    Runs LAST in the processing pipeline, after all other normalizations and LLM passes.
-    Only triggers when 4 or more top-level bullet items are present in Problem Description.
-    All other subsections (Change Drivers, ESW Turn Around, Impact Details, Issue Part Number(s))
-    are preserved unchanged.
-    """
-    if not problem_text or not problem_text.strip():
-        return problem_text
+    for rec in payload.get("sps_records") or []:
+        p = str(rec.get("problem") or "").strip()
+        if p:
+            parts.append(_clean_raw_sps_text(p))
 
-    # Extract Problem Description subsection only
-    problem_desc = _extract_subsection(problem_text, "Problem Description", PROBLEM_SUBSECTION_NAMES)
-    if not problem_desc or not problem_desc.strip():
-        return problem_text
+    cp = str(payload.get("current_problem_text") or "").strip()
+    if cp:
+        parts.append(cp)
 
-    # Count top-level bullets — only regroup when there are enough distinct items
-    top_bullet_lines = [
-        ln for ln in problem_desc.splitlines()
-        if re.match(r"^\s*-\s+\S", ln) and not re.match(r"^\s{3,}-\s+", ln)
+    if not parts:
+        parts.append(str(source_text or "").strip())
+
+    merged = "\n".join([p for p in parts if p]).strip()
+    merged = _translate_sps_to_professional(merged)
+    return merged
+
+
+def _collect_fallback_solution_text(payload: Dict[str, Any]) -> str:
+    parts: List[str] = []
+
+    for rec in payload.get("sps_records") or []:
+        s = str(rec.get("solution") or rec.get("proposed_solution") or "").strip()
+        if s:
+            parts.append(_clean_raw_sps_text(s))
+
+    cs = str(payload.get("current_solution_text") or payload.get("proposed_solution_text") or "").strip()
+    if cs:
+        parts.append(cs)
+
+    merged = "\n".join([p for p in parts if p]).strip()
+    merged = _translate_sps_to_professional(merged)
+    return merged
+
+
+def _build_sps_template_fallback(
+    payload: Dict[str, Any],
+    source_text: str,
+    problem_text: str,
+    solution_text: str,
+) -> Dict[str, str]:
+    """SPS-template-aware fallback: structures output per the SPS template catalog."""
+    combined_text = (problem_text + " " + solution_text).strip()
+    best = _select_sps_template_candidates(combined_text, max_items=1)
+    template = best[0] if best else _SPS_TEMPLATE_CATALOG[0]
+
+    # Title derived from matched SPS template
+    title_base = template.get("title_template", "Engineering Change Update")
+    title = _normalize_title_with_part_number(title_base, source_text)
+
+    # Part numbers from source
+    part_numbers = extract_part_numbers(source_text)
+    pn_section = ""
+    if part_numbers:
+        pn_section = "Affected/Impacted Part Numbers:\n" + "\n".join(
+            f"- {pn}" for pn in part_numbers[:10]
+        )
+    # Extract Part No, Supplier, MPN lines from SPS Problem/Solution text
+    part_supplier_mpn_lines = _extract_part_supplier_mpn_lines(problem_text, solution_text)
+    if part_supplier_mpn_lines:
+        pn_section = (pn_section + "\n" if pn_section else "") + part_supplier_mpn_lines
+
+    # Problem Description: template opening + actual detail bullets
+    template_problem = template.get("problem_template", "")
+    detail_bullets = _normalize_bullets(problem_text)
+    if not detail_bullets:
+        detail_bullets = "- Problem details are pending confirmation from input records."
+
+    # Change Drivers & ESW Turn Around (same as LLM success path)
+    pcr_ids = [str(rec.get("pcr_id", "")) for rec in payload.get("pcr_records") or [] if rec.get("pcr_id")]
+    project_ids = [str(rec.get("project_id", "")) for rec in payload.get("project_records") or [] if rec.get("project_id")]
+    id_parts = [f"PCR# {pid}" for pid in pcr_ids] + [f"Project# {pid}" for pid in project_ids]
+    cd_header = "Change Drivers (" + ", ".join(id_parts) + "):" if id_parts else ""
+    show_cd = bool(pcr_ids or project_ids)
+
+    payload_ref_summary = _build_reference_change_summary_from_payload(payload)
+    esw_block = _build_esw_turnaround_from_payload(payload) if payload.get("esw_records") else ""
+
+    top_block = ""
+    if show_cd:
+        top_block = cd_header
+        if payload_ref_summary:
+            top_block += "\n" + payload_ref_summary
+    if esw_block:
+        top_block = (top_block + "\n\n" + esw_block).strip() if top_block else esw_block
+
+    problem_parts: List[str] = []
+    if top_block:
+        problem_parts.append(top_block)
+    if pn_section:
+        problem_parts.append(pn_section)
+    problem_parts.append(f"Problem Description:\n{template_problem}")
+    problem_parts.append(detail_bullets)
+
+    # Dynamic Impact Details based on template category (not hardcoded)
+    sub_sub = template.get("sub_sub_category", "").lower()
+    sub_group = template.get("sub_group", "").lower()
+    main_group = template.get("main_group", "").lower()
+    if "eol" in sub_sub or "obsolescen" in sub_sub:
+        impact = (
+            "Impact Details:\n"
+            "- Supply continuity risk due to supplier-declared obsolescence.\n"
+            "- Production schedule impact if replacement parts are not qualified in time."
+        )
+    elif "new supplier" in sub_sub or "alternate supplier" in sub_sub or "avl" in sub_group or "lead time" in sub_sub:
+        impact = (
+            "Impact Details:\n"
+            "- Extended lead times and supply constraints risk material availability and production schedules.\n"
+            "- Alternate sourcing required to maintain supply continuity and meet delivery commitments."
+        )
+    elif "spec" in sub_sub or "process change" in sub_sub or "supplier change" in sub_group:
+        impact = (
+            "Impact Details:\n"
+            "- Unapproved supplier specification or process change may affect product quality and compliance.\n"
+            "- Engineering evaluation and formal disposition required before production use."
+        )
+    elif "no longer supply" in sub_group or "out of business" in sub_group:
+        impact = (
+            "Impact Details:\n"
+            "- Part unavailability due to supplier cessation creates direct production risk.\n"
+            "- Alternate supplier qualification required to restore supply continuity."
+        )
+    elif "bom" in sub_sub or "qty" in sub_sub or "missing component" in sub_sub or "wrong part" in sub_sub:
+        impact = (
+            "Impact Details:\n"
+            "- BOM inaccuracy creates risk of incorrect assembly and material planning errors.\n"
+            "- Potential rework and production delay until BOM is corrected."
+        )
+    elif "dwg" in sub_sub or "dimension" in sub_sub or "note" in sub_sub or "label" in sub_sub or "balloon" in sub_sub or "callout" in sub_sub or "flow" in sub_sub:
+        impact = (
+            "Impact Details:\n"
+            "- Drawing discrepancy creates fabrication ambiguity and inspection difficulty.\n"
+            "- Risk of non-conforming parts until drawing is corrected."
+        )
+    elif "tolerance" in sub_sub:
+        impact = (
+            "Impact Details:\n"
+            "- Unachievable tolerances create manufacturing and inspection challenges.\n"
+            "- Risk of high scrap rate and production delay."
+        )
+    elif "fit" in sub_sub or "interference" in sub_sub:
+        impact = (
+            "Impact Details:\n"
+            "- Fitment or interference issues affect assembly process and product quality.\n"
+            "- Risk of rework or field failure until design is corrected."
+        )
+    elif "performance" in sub_sub:
+        impact = (
+            "Impact Details:\n"
+            "- Design not meeting performance requirements affects product quality.\n"
+            "- Risk of field failure until design is corrected."
+        )
+    elif "supply chain" in main_group:
+        impact = (
+            "Impact Details:\n"
+            "- Supply chain disruption affecting material availability and production schedules.\n"
+            "- Corrective action required to restore supply continuity."
+        )
+    else:
+        impact = (
+            "Impact Details:\n"
+            "- Supplier-reported issue affects engineering compliance and execution consistency.\n"
+            "- Controlled engineering correction required to resolve the identified discrepancy."
+        )
+    problem_parts.append(impact)
+    problem_statement = "\n\n".join(problem_parts)
+
+    # Solution Description: template opening + actual detail bullets
+    template_solution = template.get("solution_template", "")
+    sol_bullets = _normalize_bullets(solution_text)
+    if not sol_bullets:
+        sol_bullets = "- Solution details are pending confirmation from input records."
+
+    solution_statement = (
+        f"Solution Description:\n{template_solution}\n\n{sol_bullets}"
+    )
+
+    # Apply standard cleanup
+    title = _apply_engineering_shortcuts(title)
+    problem_statement = _apply_engineering_shortcuts(problem_statement)
+    solution_statement = _apply_engineering_shortcuts(solution_statement)
+    problem_statement = _remove_supplier_rev_tokens(problem_statement)
+    solution_statement = _remove_supplier_rev_tokens(solution_statement)
+
+    return {
+        "title": title[:85],
+        "problem_statement": problem_statement[:4000],
+        "solution_statement": solution_statement[:4000],
+        "proposed_solution": solution_statement[:4000],
+    }
+
+
+def _build_ui_fallback_output(payload: Dict[str, Any], source_text: str) -> Dict[str, str]:
+    problem_text = _collect_fallback_problem_text(payload, source_text)
+    solution_text = _collect_fallback_solution_text(payload)
+
+    # When SPS records exist, use SPS template formatting instead of generic fallback
+    if _has_sps_payload(payload):
+        return _build_sps_template_fallback(payload, source_text, problem_text, solution_text)
+
+    # Non-SPS fallback: generic format
+    title = _normalize_title_with_part_number("Engineering Change Update", source_text)
+
+    overview_1 = _to_single_line_summary(problem_text, max_chars=220)
+    overview_2 = "Supplier reported this issue as requiring controlled engineering correction through ECR."
+
+    detail = _normalize_bullets(problem_text)
+    if not detail:
+        detail = "- Problem details are pending confirmation from input records."
+
+    problem_statement = (
+        "Overview:\n"
+        f"{overview_1}\n"
+        f"{overview_2}\n\n"
+        "Detailed Points:\n"
+        f"{detail}\n\n"
+        "Impact Details:\n"
+        "- Supplier-reported issue affects documented installation criteria and execution consistency.\n"
+        "- Engineering correction required to resolve the identified discrepancy."
+    )
+
+    sol_detail = _normalize_bullets(solution_text)
+    if not sol_detail:
+        sol_detail = "- Solution details are pending confirmation from input records."
+
+    sol_lines = [
+        re.sub(r"^\s*[-*•]\s*", "", ln).strip()
+        for ln in sol_detail.splitlines()
+        if re.match(r"^\s*[-*•]\s+", ln)
     ]
-    if len(top_bullet_lines) < 4:
-        return problem_text  # Not enough content to meaningfully group
+    if not sol_lines:
+        sol_lines = ["Solution details are pending confirmation from input records."]
+    sol_ov_lines = sol_lines[:2]
+    sol_overview = "\n".join([f"- {x}" for x in sol_ov_lines])
 
-    prompt = (
-        "You are a senior manufacturing engineer finalizing an ECR Problem Description for PLM submission.\n\n"
-        "TASK: Review the Problem Description below and rewrite it by GROUPING similar change items "
-        "under numbered category headers. This is the final formatting step before PLM entry.\n\n"
-        "STRICT RULES:\n"
-        "1. Write 1-2 introductory sentence(s) as plain prose (no bullet) establishing: "
-        "part name, Applied Materials P/N (if present), supplier name, and overall change reason.\n"
-        "2. Group all change details under numbered category headers. "
-        "Use ONLY categories that have actual content in the input:\n"
-        "   1. Supplier-Driven Obsolescence\n"
-        "   2. Electronic Component Changes\n"
-        "   3. Mechanical / Hardware Changes\n"
-        "   4. Firmware / Software Changes\n"
-        "   5. Process / Design Changes\n"
-        "3. Under each category header, list each change as a sub-bullet starting with '- '.\n"
-        "4. For component changes use format:\n"
-        "   - Old Manufacturer (MPN old) changed to New Manufacturer (MPN new): description\n"
-        "   - OR: MPN old changed to MPN new: description (if same manufacturer)\n"
-        "   - Use 'From: <old value> To: <new value>' for version/revision/firmware changes.\n"
-        "5. Applied Materials P/N (NNNN-NNNNN format) must appear ONLY in the introductory "
-        "summary. Do NOT repeat it in any category sub-bullet — reference 'the part', "
-        "'this component', or the supplier MPN instead.\n"
-        "6. PLAIN TEXT ONLY: No arrows (->), Unicode special characters, or markdown formatting. "
-        "Use only plain hyphens (-) for sub-bullets.\n"
-        "7. Preserve ALL factual data exactly: part numbers, manufacturer names, version numbers, "
-        "MPN codes, descriptions.\n"
-        "8. Do NOT add assumptions, generic statements, or content not in the input.\n"
-        "9. Do NOT include a numbered category if it has no items.\n"
-        "10. If only one category applies (all changes are the same type), write that one "
-        "category with its sub-bullets.\n\n"
-        "OUTPUT FORMAT — use exactly this structure:\n"
-        "<Introductory summary sentence(s) as plain prose>\n\n"
-        "N. <Category Name>\n"
-        "- <change sub-bullet>\n"
-        "- <change sub-bullet>\n\n"
-        "(repeat for each applicable numbered category)\n\n"
-        "PROBLEM DESCRIPTION TO REGROUP:\n"
-        f"{problem_desc.strip()}"
+    solution_statement = (
+        "Solution Description:\n"
+        "Overview:\n"
+        f"{sol_overview}\n\n"
+        "Detailed Points:\n"
+        f"{sol_detail}"
     )
 
-    result = _call_databricks(prompt)
-    if not result or result.startswith("Error:"):
-        return problem_text
-
-    # clean_ai_output strips markdown bold/italic, heading markers, etc.
-    regrouped = clean_ai_output(result.strip())
-    if not regrouped:
-        return problem_text
-
-    # Preserve all other subsections; only replace Problem Description content.
-    m_ref_header = re.search(
-        r"^\s*(Change\s+Drivers(?:\s*\([^\n)]*\))?)\s*:",
-        problem_text,
-        flags=re.IGNORECASE | re.MULTILINE,
-    )
-    change_drivers_header = m_ref_header.group(1).strip() + ":" if m_ref_header else "Change Drivers:"
-
-    m_esw_header = re.search(
-        r"^\s*(ESW\s+Turn\s+Around(?:\s*\([^\n)]*\))?)\s*:",
-        problem_text,
-        flags=re.IGNORECASE | re.MULTILINE,
-    )
-    esw_turnaround_header = m_esw_header.group(1).strip() + ":" if m_esw_header else "ESW Turn Around:"
-
-    ref = _extract_subsection(problem_text, "Change Drivers", PROBLEM_SUBSECTION_NAMES)
-    esw_turnaround = _extract_subsection(problem_text, "ESW Turn Around", PROBLEM_SUBSECTION_NAMES)
-    impact_details = _extract_subsection(problem_text, "Impact Details", PROBLEM_SUBSECTION_NAMES)
-    issue_parts = _extract_subsection(problem_text, "Issue Part Number(s)", PROBLEM_SUBSECTION_NAMES)
-    if not issue_parts:
-        issue_parts = _extract_subsection(problem_text, "Issue Part Numbers", PROBLEM_SUBSECTION_NAMES)
-
-    blocks: List[str] = []
-    if ref:
-        blocks.append(change_drivers_header + "\n" + ref.strip())
-    if esw_turnaround:
-        blocks.append(esw_turnaround_header + "\n" + esw_turnaround.strip())
-    blocks.append("Problem Description:\n" + regrouped.strip())
-    if impact_details:
-        blocks.append("Impact Details:\n" + impact_details.strip())
-    blocks.append("Issue Part Number(s):\n" + (issue_parts.strip() if issue_parts else "-"))
-
-    return "\n\n".join(blocks).strip()
+    return {
+        "title": title[:85],
+        "problem_statement": problem_statement[:4000],
+        "solution_statement": solution_statement[:4000],
+        "proposed_solution": solution_statement[:4000],
+    }
 
 
 def generate_full_pss(payload: Dict[str, Any]) -> Dict[str, str]:
@@ -5478,10 +5688,13 @@ def generate_full_pss(payload: Dict[str, Any]) -> Dict[str, str]:
     drafted = str(drafted or "").strip()
 
     if not drafted or drafted.startswith("Error:"):
+        print(f"[AI_Assisted_PSS] LLM call failed or returned empty, using fallback. Response: {drafted[:300]}")
+        fb = _build_ui_fallback_output(payload, source_text)
         return {
-            "title": str(payload.get("short_title") or "").strip()[:200],
-            "problem_statement": (payload.get("current_problem_text") or source_text),
-            "solution_statement": str(payload.get("current_solution_text") or payload.get("proposed_solution_text") or ""),
+            "title": fb.get("title", "")[:85],
+            "problem_statement": fb.get("problem_statement", "")[:4000],
+            "solution_statement": fb.get("solution_statement", "")[:4000],
+            "proposed_solution": fb.get("proposed_solution", "")[:4000],
             "raw": drafted or "",
         }
 
@@ -5537,15 +5750,6 @@ def generate_full_pss(payload: Dict[str, Any]) -> Dict[str, str]:
         source_text,
     )
 
-    # Keep reframed LLM output as primary; use deterministic source content only as fallback.
-    if not normalized_problem:
-        normalized_problem = _build_complete_problem_description(payload)
-
-    # NOTE: Raw source-line backfill into Problem Description is intentionally disabled.
-    # It can inject long copy-pasted source sentences that violate the expected format.
-
-    normalized_solution = _build_complete_solution_statement(payload, normalized_solution)
-
     # Enforce user rule: Title must reference Issue P/N (single issue only).
     issue_pns_for_title = _extract_issue_part_numbers_from_problem(normalized_problem)
     if len(issue_pns_for_title) == 1:
@@ -5582,41 +5786,74 @@ def generate_full_pss(payload: Dict[str, Any]) -> Dict[str, str]:
     normalized_problem = _remove_supplier_rev_tokens(normalized_problem)
     normalized_solution = _remove_supplier_rev_tokens(normalized_solution)
 
-    # Formatting guardrail: maintain exactly one blank line between sections.
-    normalized_problem = _enforce_single_blank_line_between_sections(normalized_problem)
-    normalized_solution = _enforce_single_blank_line_between_sections(normalized_solution)
+    if _has_sps_payload(payload):
+        title, normalized_problem, normalized_solution = _review_sps_template_alignment(
+            title,
+            normalized_problem,
+            normalized_solution,
+            source_text,
+            payload,
+        )
+        title = _apply_engineering_shortcuts(title)
+        normalized_problem = _apply_engineering_shortcuts(normalized_problem)
+        normalized_solution = _apply_engineering_shortcuts(normalized_solution)
+        normalized_problem = _remove_supplier_rev_tokens(normalized_problem)
+        normalized_solution = _remove_supplier_rev_tokens(normalized_solution)
 
-    # PLM Final Step 1: Group similar change items in Problem Description under numbered
-    # category headers (Electronic, Mechanical, Firmware, etc.). Runs last so it operates
-    # on the fully-normalized output. Only activates when 4+ top-level bullets exist.
-    normalized_problem = _regroup_problem_description(normalized_problem, source_text)
+        issue_pns_for_title = _extract_issue_part_numbers_from_problem(normalized_problem)
+        if len(issue_pns_for_title) == 1:
+            title = _normalize_title_with_part_number(
+                title,
+                source_text,
+                lead_pn_override=issue_pns_for_title[0],
+                force_no_prefix=False,
+            )
+        elif len(issue_pns_for_title) > 1:
+            title = _normalize_title_with_part_number(
+                title,
+                source_text,
+                lead_pn_override="",
+                force_no_prefix=True,
+            )
+        normalized_solution = _enforce_obsolescence_solution_style(
+            normalized_solution,
+            normalized_problem,
+            source_text,
+        )
 
-    # PLM Final Step 2: Apply bold formatting to From: and To: labels throughout both
-    # statements. Deterministic post-processor — runs after all LLM calls and
-    # clean_ai_output invocations so bold markers are preserved in the final output.
-    normalized_problem = _bold_from_to_values(normalized_problem)
-    normalized_solution = _bold_from_to_values(normalized_solution)
+    if not title:
+        title = _normalize_title_with_part_number(
+            str(payload.get("short_title") or "").strip(),
+            source_text,
+        )
+    if not title:
+        title = _normalize_title_with_part_number("Engineering Change Update", source_text)
 
-    # Fallback: if parsing extracted nothing despite the LLM returning content,
-    # use the raw drafted text so the caller never gets all-empty fields.
-    if not any([title, normalized_problem, normalized_solution]) and drafted:
-        return {
-            "title": str(payload.get("short_title") or "").strip()[:200],
-            "problem_statement": drafted,
-            "solution_statement": str(payload.get("current_solution_text") or payload.get("proposed_solution_text") or ""),
-            "raw": drafted[:12000],
-        }
+    if not normalized_problem:
+        normalized_problem = (payload.get("current_problem_text") or source_text or "").strip()
+
+    if not normalized_solution:
+        normalized_solution = str(
+            payload.get("current_solution_text")
+            or payload.get("proposed_solution_text")
+            or payload.get("solution")
+            or ""
+        ).strip()
+
+    if not normalized_solution:
+        normalized_solution = "- Solution details are pending confirmation from input records."
 
     return {
         "title": title[:85],
-        "problem_statement": normalized_problem,
-        "solution_statement": normalized_solution,
+        "problem_statement": normalized_problem[:4000],
+        "solution_statement": normalized_solution[:4000],
+        "proposed_solution": normalized_solution[:4000],
         "raw": drafted[:12000],
     }
 
 
 def generate_problem_summary(payload: Dict[str, Any]) -> str:
-    return generate_full_pss(payload).get("problem_statement", "")
+    return generate_full_pss(payload).get("problem_statement", "")[:4000]
 
 
 def generate_pss(payload: Dict[str, Any]) -> str:

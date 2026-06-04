@@ -27,96 +27,6 @@ if not DATABRICKS_URL or not DATABRICKS_API_KEY:
 else:
     print("Databricks environment variables loaded successfully.")
 
-
-
-
-
-# ----------------------------
-# NEW: SPS PREPROCESSOR
-# ----------------------------
-def preprocess_sps_text(user_text: str) -> str:
-    if not user_text:
-        return ""
-
-    problem_lines = []
-    solution_lines = []
-    issue_parts = []
-    parent_parts = []
-    esw_lines = []
-
-    lines = user_text.splitlines()
-
-    for line in lines:
-        l = line.strip()
-
-        # Problem extraction
-        if "supplier-reported issue" in l.lower():
-            problem_lines.append(l.split(":", 1)[-1].strip())
-
-        # Solution extraction
-        elif "supplier-proposed change" in l.lower():
-            solution_lines.append(l.split(":", 1)[-1].strip())
-
-        # Part number extraction
-        parts = re.findall(r"\b\d{4}-\d{5}\b", l)
-        if parts:
-            if "part number" in l.lower():
-                parent_parts.extend(parts)
-            else:
-                issue_parts.extend(parts)
-
-        # ESW detection
-        if "esw" in l.lower():
-            esw_lines.append(l)
-
-        # Replacement detection
-        match = re.search(
-            r"change\s+(\d{4}-\d{5})\s+to\s+(\d{4}-\d{5})",
-            l,
-            re.IGNORECASE,
-        )
-        if match:
-            old_part = match.group(1)
-            new_part = match.group(2)
-
-            issue_parts.append(old_part)
-            solution_lines.append(f"Replace {old_part} with {new_part}")
-
-    # Remove duplicates
-    issue_parts = list(dict.fromkeys(issue_parts))
-    parent_parts = list(dict.fromkeys(parent_parts))
-
-    # Build structured text
-    structured = []
-
-    if problem_lines:
-        structured.append(
-            "Problem:\n" + "\n".join(f"- {p}" for p in problem_lines)
-        )
-
-    if solution_lines:
-        structured.append(
-            "Solution:\n" + "\n".join(f"- {s}" for s in solution_lines)
-        )
-
-    if issue_parts:
-        structured.append(
-            "Issue Part Number(s):\n" + ", ".join(issue_parts)
-        )
-
-    if parent_parts:
-        structured.append(
-            "Parent Part Number(s):\n" + ", ".join(parent_parts)
-        )
-
-    if esw_lines:
-        structured.append(
-            "ESW:\n" + "\n".join(esw_lines)
-        )
-
-    return "\n\n".join(structured)
-
-
 # ----------------------------
 # Constants
 # ----------------------------
@@ -3009,40 +2919,88 @@ INPUT:
 """.strip()
 
 
-def reframe_problem(user_text: str, supply_chain_scenario: bool = False):
-
-    # ✅ Step 1: Preprocess raw SPS input
-    user_text = preprocess_sps_text(user_text)
-
-    # ✅ Step 2: Ensure Solution exists
-    if "Solution:" not in user_text:
-        matches = re.findall(r"propose.*", user_text, re.IGNORECASE)
-        if matches:
-            solution_text = "\n".join(matches)
-            user_text += "\n\nSolution:\n- " + solution_text
-
-    # ✅ Step 3: Add Change Drivers if missing (SPS-only case)
-    if "Change Drivers:" not in user_text:
-        user_text += (
-            "\n\nChange Drivers:\n"
-            "- This change is to drive supply continuity due to supplier constraint.\n"
-            "- This change is to drive temporary substitution until source stabilization."
-        )
-
-    # ✅ Step 4: Call your existing prompt logic
-    prompt = _build_engineering_prompt(
-        user_text,
-        supply_chain_scenario=supply_chain_scenario
-    )
-
+def reframe_problem(user_text: str, supply_chain_scenario: bool = False) -> str:
+    prompt = _build_engineering_prompt(user_text, supply_chain_scenario)
     draft = _call_databricks(prompt)
-
     if draft.startswith("Error:"):
         return draft
 
-    # ✅ Step 5: Clean output
     draft = clean_ai_output(draft)
     draft = remove_unwanted_sections(draft)
+    draft = _remove_supplier_rev_tokens(draft)
+
+    # Apply low-cost deterministic cleanup before any second pass.
+    draft = re.sub(r"\bSPS\s*#?\s*\d+\b", "", draft, flags=re.IGNORECASE)
+    if supply_chain_scenario:
+        draft = _sanitize_supply_chain_numbers(draft)
+
+    def _critical_violations(items: List[str]) -> List[str]:
+        return [
+            v for v in items
+            if any(kw in v for kw in ("SPS", "Missing", "must not be empty"))
+        ]
+
+    violations = validate_engineering_output(draft, user_text)
+    critical_violations = _critical_violations(violations)
+
+    if not critical_violations:
+        return draft
+
+    # Lightweight deterministic normalization pass (no extra LLM call).
+    title = _normalize_title_with_part_number(_extract_title(draft).strip(), user_text)
+    problem_section = _extract_section(draft, "Problem Statement").strip()
+    solution_section = _extract_section(draft, "Solution Statement").strip() or _extract_section(draft, "Proposed Solution").strip()
+
+    normalized_problem = _normalize_problem_statement(problem_section, user_text)
+    normalized_solution = _normalize_solution_statement(solution_section, user_text)
+    deterministic = (
+        f"Title:\n{title}\n\n"
+        f"Problem Statement:\n{normalized_problem}\n\n"
+        f"Solution Statement:\n{normalized_solution}"
+    ).strip()
+    deterministic = clean_ai_output(deterministic)
+    deterministic = remove_unwanted_sections(deterministic)
+    deterministic = _remove_supplier_rev_tokens(deterministic)
+    deterministic = re.sub(r"\bSPS\s*#?\s*\d+\b", "", deterministic, flags=re.IGNORECASE)
+    if supply_chain_scenario:
+        deterministic = _sanitize_supply_chain_numbers(deterministic)
+
+    deterministic_violations = validate_engineering_output(deterministic, user_text)
+    deterministic_critical = _critical_violations(deterministic_violations)
+    if len(deterministic_critical) < len(critical_violations):
+        draft = deterministic
+        critical_violations = deterministic_critical
+
+    # Short corrective prompt fallback only when critical violations remain.
+    if critical_violations:
+        fix_prompt = f"""
+Fix only these violations in the current draft:
+
+- {"\n- ".join(critical_violations)}
+
+Return the full corrected output using only these top-level headers:
+Title:
+Problem Statement:
+Solution Statement:
+
+Do not add explanations. Preserve existing valid content and edit minimally.
+
+Current draft:
+{draft}
+""".strip()
+        revised = _call_databricks(fix_prompt)
+        if not revised.startswith("Error:"):
+            revised = clean_ai_output(revised)
+            revised = remove_unwanted_sections(revised)
+            revised = _remove_supplier_rev_tokens(revised)
+            revised = re.sub(r"\bSPS\s*#?\s*\d+\b", "", revised, flags=re.IGNORECASE)
+            if supply_chain_scenario:
+                revised = _sanitize_supply_chain_numbers(revised)
+
+            revised_violations = validate_engineering_output(revised, user_text)
+            revised_critical = _critical_violations(revised_violations)
+            if len(revised_critical) <= len(critical_violations):
+                draft = revised
 
     return draft
 

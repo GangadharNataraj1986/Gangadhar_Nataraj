@@ -80,7 +80,11 @@ SELECT DISTINCT
   CAST(NULL AS STRING)            AS sparable_flag,
     CAST(NULL AS STRING)            AS designator,
     CAST(NULL AS STRING)            AS option_class,
-  m.prcrmnttype                   AS procurement_type,
+    CASE COALESCE(UPPER(m.prcrmnttype), '')
+        WHEN 'E' THEN 'Make'
+        WHEN 'F' THEN 'Buy'
+        ELSE COALESCE(m.prcrmnttype, '')
+    END                             AS procurement_type,
   m.useritemtype                  AS user_item_type,
   m.program_type                  AS pace_or_dash,
   CAST('' AS STRING)              AS mlo_class,
@@ -110,7 +114,11 @@ SELECT DISTINCT
   b.sprprtind                     AS sparable_flag,
     COALESCE(ol.refdesignator, '')  AS designator,
     COALESCE(ol.option_class, '')   AS option_class,
-  COALESCE(m.prcrmnttype, '')     AS procurement_type,
+    CASE COALESCE(UPPER(m.prcrmnttype), '')
+        WHEN 'E' THEN 'Make'
+        WHEN 'F' THEN 'Buy'
+        ELSE COALESCE(m.prcrmnttype, '')
+    END                             AS procurement_type,
   COALESCE(m.useritemtype, '')    AS user_item_type,
   COALESCE(m.program_type, '')    AS pace_or_dash,
   CAST('' AS STRING)              AS mlo_class,
@@ -142,6 +150,7 @@ WHERE b.materialnum IN ({placeholders})
   AND b.plantcd = '{plant}'
   AND b.rflg = 1
   AND COALESCE(UPPER(b.cmpntactn), '') <> 'DISABLE'
+  AND COALESCE(UPPER(ms.desc), '') NOT IN ('PLC_OBSOLETE', 'PLC_INACTIVATE')
 """
 
 

@@ -27,6 +27,16 @@ _IN_CHUNK_SIZE = 1000              # max parts per SQL IN list before splitting 
 _PARALLEL_SHARD_SIZE = 120         # per-query part count when parallelizing large runs
 _MAX_PARALLEL_WORKERS = 4          # safe upper bound for concurrent ODBC query threads
 
+_CONFIG_PREFIXES = {
+    '0490', '0491', '0495', '0497', '0430', '0350', '0355', '0351', '0357',
+    '0390', '0395', '0397', '0335', '0391', '0431', '0435', '0437',
+    '0440', '0445', '0455', '0450', '0441', '0447', '0457',
+    '0460', '0465', '0461', '0467', '0410', '0415', '0417',
+    '0411', '0412', '0413', '0414', '0360', '0365', '0361', '0367',
+}
+_LISTING_PREFIXES = {'0243', '0288', '0289', '0290'}
+_PRUNE_ANCHOR_PREFIXES = _CONFIG_PREFIXES | _LISTING_PREFIXES
+
 # ---------------------------------------------------------------------------
 # Persistent shared connection for the Orphan Analysis WU import flow.
 # Unlike _THREAD_LOCAL (which creates a new connection per thread), this
@@ -113,7 +123,11 @@ SELECT DISTINCT
   CAST(1 AS DECIMAL(13,3))        AS ext_qty,
   m.uomcd                         AS uom,
   CAST(NULL AS STRING)            AS eco_number,
-  m.prcrmnttype                   AS procurement_type,
+  CASE COALESCE(UPPER(m.prcrmnttype), '')
+        WHEN 'E' THEN 'Make'
+        WHEN 'F' THEN 'Buy'
+    ELSE COALESCE(m.prcrmnttype, '')
+  END                             AS procurement_type,
   CAST(NULL AS STRING)            AS effectivity_date,
   m.useritemtype                  AS user_item_type,
   CAST(NULL AS STRING)            AS item_seq,
@@ -122,11 +136,32 @@ SELECT DISTINCT
     CAST(NULL AS STRING)            AS designator,
     CAST(NULL AS STRING)            AS option_class,
   m.program_type                  AS pace_or_dash,
-  CAST('' AS STRING)              AS mlo_class,
+    COALESCE(
+        csg.mlo_class,
+        CASE
+            WHEN LOWER(COALESCE(m.program_type, '')) LIKE '%class 1%' THEN 'Class 1'
+            WHEN LOWER(COALESCE(m.program_type, '')) LIKE '%class 2%' THEN 'Class 2'
+            WHEN LOWER(COALESCE(m.program_type, '')) LIKE '%class 3%' THEN 'Class 3'
+            ELSE ''
+        END
+    )                               AS mlo_class,
   m.materialnum                   AS input_part
 FROM prd.ud_gsco.material_master m
 LEFT JOIN prd.pd_gcat.dimmaterialstatus ms
   ON m.crossplantmaterialstatus = ms.materialstatuscd
+LEFT JOIN (
+        SELECT
+            Part AS part,
+            COALESCE(
+                MAX(CASE WHEN LOWER(COALESCE(place, '')) LIKE '%class 1%' THEN 'Class 1' END),
+                MAX(CASE WHEN LOWER(COALESCE(place, '')) LIKE '%class 2%' THEN 'Class 2' END),
+                MAX(CASE WHEN LOWER(COALESCE(place, '')) LIKE '%class 3%' THEN 'Class 3' END),
+                CAST('' AS STRING)
+            ) AS mlo_class
+        FROM prd.ud_gsco.csg
+        GROUP BY Part
+) csg
+    ON m.materialnum = csg.part
 WHERE m.materialnum IN ({placeholders})
   AND m.plantcd = '{plant}'
 """
@@ -152,16 +187,50 @@ SELECT DISTINCT
   b.sprprtind                         AS sparable_flag,
     COALESCE(ol.refdesignator, '')      AS designator,
     COALESCE(ol.option_class, '')       AS option_class,
-  COALESCE(m.prcrmnttype, '')         AS procurement_type,
+  CASE COALESCE(UPPER(m.prcrmnttype), '')
+        WHEN 'E' THEN 'Make'
+        WHEN 'F' THEN 'Buy'
+    ELSE COALESCE(m.prcrmnttype, '')
+  END                                 AS procurement_type,
   COALESCE(m.useritemtype, '')        AS user_item_type,
   COALESCE(m.program_type, '')        AS pace_or_dash,
-  CAST('' AS STRING)              AS mlo_class
+    COALESCE(
+        NULLIF(
+            CASE
+                WHEN LOWER(COALESCE(ol.option_class, '')) LIKE '%class 1%' THEN 'Class 1'
+                WHEN LOWER(COALESCE(ol.option_class, '')) LIKE '%class 2%' THEN 'Class 2'
+                WHEN LOWER(COALESCE(ol.option_class, '')) LIKE '%class 3%' THEN 'Class 3'
+                ELSE ''
+            END,
+            ''
+        ),
+        csg.mlo_class,
+        CASE
+            WHEN LOWER(COALESCE(m.program_type, '')) LIKE '%class 1%' THEN 'Class 1'
+            WHEN LOWER(COALESCE(m.program_type, '')) LIKE '%class 2%' THEN 'Class 2'
+            WHEN LOWER(COALESCE(m.program_type, '')) LIKE '%class 3%' THEN 'Class 3'
+            ELSE ''
+        END
+    )                                   AS mlo_class
 FROM prd.pd_mm.factbomlvl1 b
 LEFT JOIN prd.ud_gsco.material_master m
   ON b.materialnum = m.materialnum
  AND b.plantcd     = m.plantcd
 LEFT JOIN prd.pd_gcat.dimmaterialstatus ms
   ON m.crossplantmaterialstatus = ms.materialstatuscd
+LEFT JOIN (
+        SELECT
+            Part AS part,
+            COALESCE(
+                MAX(CASE WHEN LOWER(COALESCE(place, '')) LIKE '%class 1%' THEN 'Class 1' END),
+                MAX(CASE WHEN LOWER(COALESCE(place, '')) LIKE '%class 2%' THEN 'Class 2' END),
+                MAX(CASE WHEN LOWER(COALESCE(place, '')) LIKE '%class 3%' THEN 'Class 3' END),
+                CAST('' AS STRING)
+            ) AS mlo_class
+        FROM prd.ud_gsco.csg
+        GROUP BY Part
+) csg
+    ON b.cmpntmaterialnum = csg.part
 LEFT JOIN (
     SELECT option, option_class, refdesignator
     FROM (
@@ -183,6 +252,7 @@ WHERE b.cmpntmaterialnum IN ({placeholders})
   AND b.plantcd = '{plant}'
         AND b.rflg = 1
         AND COALESCE(UPPER(b.cmpntactn), '') <> 'DISABLE'
+        AND COALESCE(UPPER(ms.desc), '') NOT IN ('PLC_OBSOLETE', 'PLC_INACTIVATE')
         AND (
             (UPPER(b.materialnum) LIKE 'ESW%' AND LENGTH(b.materialnum) > 10)
             OR (LENGTH(b.materialnum) = 10 AND SUBSTRING(b.materialnum, 5, 1) = '-')
@@ -208,7 +278,18 @@ SELECT DISTINCT
   b.sprprtind                         AS sparable_flag
     , COALESCE(ol.refdesignator, '')    AS designator
     , COALESCE(ol.option_class, '')     AS option_class
+        , CASE
+                WHEN LOWER(COALESCE(ol.option_class, '')) LIKE '%class 1%' THEN 'Class 1'
+                WHEN LOWER(COALESCE(ol.option_class, '')) LIKE '%class 2%' THEN 'Class 2'
+                WHEN LOWER(COALESCE(ol.option_class, '')) LIKE '%class 3%' THEN 'Class 3'
+                ELSE ''
+            END                                AS mlo_class
 FROM prd.pd_mm.factbomlvl1 b
+LEFT JOIN prd.ud_gsco.material_master m
+  ON b.materialnum = m.materialnum
+ AND b.plantcd     = m.plantcd
+LEFT JOIN prd.pd_gcat.dimmaterialstatus ms
+  ON m.crossplantmaterialstatus = ms.materialstatuscd
 LEFT JOIN (
     SELECT option, option_class, refdesignator
     FROM (
@@ -230,6 +311,7 @@ WHERE b.cmpntmaterialnum IN ({placeholders})
   AND b.plantcd = '{plant}'
   AND b.rflg = 1
   AND COALESCE(UPPER(b.cmpntactn), '') <> 'DISABLE'
+  AND COALESCE(UPPER(ms.desc), '') NOT IN ('PLC_OBSOLETE', 'PLC_INACTIVATE')
     AND (
         (UPPER(b.materialnum) LIKE 'ESW%' AND LENGTH(b.materialnum) > 10)
         OR (LENGTH(b.materialnum) = 10 AND SUBSTRING(b.materialnum, 5, 1) = '-')
@@ -242,13 +324,38 @@ _SQL_METADATA_BATCH = """
 SELECT DISTINCT
   m.materialnum                          AS part,
   COALESCE(ms.desc, '')                  AS item_status,
-  COALESCE(m.prcrmnttype, '')            AS procurement_type,
+  CASE COALESCE(UPPER(m.prcrmnttype), '')
+        WHEN 'E' THEN 'Make'
+        WHEN 'F' THEN 'Buy'
+    ELSE COALESCE(m.prcrmnttype, '')
+  END                                    AS procurement_type,
   COALESCE(m.useritemtype, '')           AS user_item_type,
   COALESCE(m.program_type, '')           AS pace_or_dash,
-  CAST('' AS STRING)                     AS mlo_class
+    COALESCE(
+        csg.mlo_class,
+        CASE
+            WHEN LOWER(COALESCE(m.program_type, '')) LIKE '%class 1%' THEN 'Class 1'
+            WHEN LOWER(COALESCE(m.program_type, '')) LIKE '%class 2%' THEN 'Class 2'
+            WHEN LOWER(COALESCE(m.program_type, '')) LIKE '%class 3%' THEN 'Class 3'
+            ELSE ''
+        END
+    )                                      AS mlo_class
 FROM prd.ud_gsco.material_master m
 LEFT JOIN prd.pd_gcat.dimmaterialstatus ms
   ON m.crossplantmaterialstatus = ms.materialstatuscd
+LEFT JOIN (
+        SELECT
+            Part AS part,
+            COALESCE(
+                MAX(CASE WHEN LOWER(COALESCE(place, '')) LIKE '%class 1%' THEN 'Class 1' END),
+                MAX(CASE WHEN LOWER(COALESCE(place, '')) LIKE '%class 2%' THEN 'Class 2' END),
+                MAX(CASE WHEN LOWER(COALESCE(place, '')) LIKE '%class 3%' THEN 'Class 3' END),
+                CAST('' AS STRING)
+            ) AS mlo_class
+        FROM prd.ud_gsco.csg
+        GROUP BY Part
+) csg
+    ON m.materialnum = csg.part
 WHERE m.materialnum IN ({placeholders})
   AND m.plantcd = '{plant}'
 """
@@ -447,6 +554,46 @@ def _is_valid_part(part: str) -> bool:
     return False
 
 
+def _normalize_part_token(part: str) -> str:
+    return ''.join((part or '').split()).upper()
+
+
+def _should_drop_parent_row(
+    part: str,
+    level: int,
+    retain_9024: bool,
+    retain_esw: bool,
+) -> bool:
+    if level == 0:
+        return False
+    token = _normalize_part_token(part)
+    if not token:
+        return False
+    if (not retain_9024) and token.startswith('9024'):
+        return True
+    if (not retain_esw) and token.startswith('ESW'):
+        return True
+    return False
+
+
+def _should_stop_traversal_through_parent(
+    part: str,
+    retain_9024: bool,
+    retain_esw: bool,
+    retain_above_cfg: bool,
+) -> bool:
+    token = _normalize_part_token(part)
+    if not token:
+        return False
+    if (not retain_9024) and token.startswith('9024'):
+        return True
+    if (not retain_esw) and token.startswith('ESW'):
+        return True
+    if (not retain_above_cfg) and token[:4] in _PRUNE_ANCHOR_PREFIXES:
+        return True
+    return False
+
+
 def _to_tree_order(records: list[dict], root_parts: list[str]) -> list[dict]:
     """Reorder flat records into depth-first bottom-up tree order.
 
@@ -503,7 +650,14 @@ def _to_tree_order(records: list[dict], root_parts: list[str]) -> list[dict]:
     return result
 
 
-def fetch_where_used(obs_parts: list[str], max_level: int, plant: str = "4070") -> list[dict[str, Any]]:
+def fetch_where_used(
+    obs_parts: list[str],
+    max_level: int,
+    plant: str = "4070",
+    retain_9024: bool = True,
+    retain_esw: bool = True,
+    retain_above_cfg: bool = True,
+) -> list[dict[str, Any]]:
     """Query Databricks for multi-level Where Used data for the given OBS parts.
 
     Uses one focused query per BOM level (iterative) instead of a single large
@@ -519,6 +673,15 @@ def fetch_where_used(obs_parts: list[str], max_level: int, plant: str = "4070") 
     plant : str
         Plant code to filter BOM and material master rows (e.g. "4070").
         Must be one of the known plant codes; defaults to "4070".
+    retain_9024 : bool
+        When False, skip importing parent rows starting with 9024 and stop
+        traversal through those branches.
+    retain_esw : bool
+        When False, skip importing parent rows starting with ESW and stop
+        traversal through those branches.
+    retain_above_cfg : bool
+        When False, stop traversal above config/listing anchor prefixes
+        (SmBOM above Config removal behavior).
 
     Returns
     -------
@@ -683,12 +846,26 @@ def fetch_where_used(obs_parts: list[str], max_level: int, plant: str = "4070") 
                         rec_out["input_part"] = source.get("input_part", child)
                         rec_out["_child_path_key"] = child_path_key
                         rec_out["_node_path_key"] = "->".join(source["path"] + (parent_key,))
-                        records.append(rec_out)
+                        drop_parent_row = _should_drop_parent_row(
+                            parent,
+                            level,
+                            retain_9024=retain_9024,
+                            retain_esw=retain_esw,
+                        )
+                        stop_traversal = _should_stop_traversal_through_parent(
+                            parent,
+                            retain_9024=retain_9024,
+                            retain_esw=retain_esw,
+                            retain_above_cfg=retain_above_cfg,
+                        )
+
+                        if not drop_parent_row:
+                            records.append(rec_out)
 
                         # Continue only one direct hop upward. Allow the same parent to
                         # appear again if it is reached through a different chain, but do
                         # not create a cycle inside the same chain path.
-                        if parent_key not in source["path"]:
+                        if (not stop_traversal) and parent_key not in source["path"]:
                             next_nodes.append({
                                 "current_part": parent,
                                 "input_part": rec_out["input_part"],
@@ -714,6 +891,9 @@ def fetch_where_used_parents_only(
     obs_parts: list[str],
     max_level: int,
     plant: str = "4070",
+    retain_9024: bool = True,
+    retain_esw: bool = True,
+    retain_above_cfg: bool = True,
     log_callback=None,
 ) -> list[dict[str, Any]]:
     """Like fetch_where_used() but skips the level-0 Databricks lookup.
@@ -881,9 +1061,23 @@ def fetch_where_used_parents_only(
                             rec_out.setdefault("mlo_class", "")
                             rec_out.setdefault("designator", "")
                             rec_out.setdefault("option_class", "")
-                            records.append(rec_out)
+                            drop_parent_row = _should_drop_parent_row(
+                                parent,
+                                level,
+                                retain_9024=retain_9024,
+                                retain_esw=retain_esw,
+                            )
+                            stop_traversal = _should_stop_traversal_through_parent(
+                                parent,
+                                retain_9024=retain_9024,
+                                retain_esw=retain_esw,
+                                retain_above_cfg=retain_above_cfg,
+                            )
 
-                            if parent_key not in source["path"]:
+                            if not drop_parent_row:
+                                records.append(rec_out)
+
+                            if (not stop_traversal) and parent_key not in source["path"]:
                                 next_nodes.append({
                                     "current_part": parent,
                                     "input_part": rec_out["input_part"],
@@ -893,18 +1087,18 @@ def fetch_where_used_parents_only(
 
                     current_nodes = next_nodes
 
-                # ── Single metadata batch for all discovered parents ───────────
-                parent_parts = list(dict.fromkeys(
-                    r["part"] for r in records if r.get("wu_level", "0") != "0" and r.get("part")
+                # ── Single metadata batch for all parts in result (incl. level 0) ─
+                all_parts = list(dict.fromkeys(
+                    r["part"] for r in records if r.get("part")
                 ))
-                if parent_parts:
-                    _log(f"[{_time.strftime('%H:%M:%S')}] Fetching metadata for {len(parent_parts)} unique parent part(s)...")
+                if all_parts:
+                    _log(f"[{_time.strftime('%H:%M:%S')}] Fetching metadata for {len(all_parts)} unique part(s)...")
                     _tm = _time.perf_counter()
                     meta_map: dict[str, dict] = {}
                     mr, mc = _run_query_in_chunks(
                         cursor,
                         _SQL_METADATA_BATCH,
-                        parent_parts,
+                        all_parts,
                         safe_plant,
                     )
                     _log(f"[{_time.strftime('%H:%M:%S')}] Metadata fetch done in {_time.perf_counter() - _tm:.1f}s.")
@@ -915,14 +1109,12 @@ def fetch_where_used_parents_only(
                         }
                         meta_map[md["part"].upper()] = md
                     for rec in records:
-                        if rec.get("wu_level", "0") == "0":
-                            continue
                         meta = meta_map.get(rec["part"].upper(), {})
                         rec["item_status"]      = meta.get("item_status", "")
                         rec["procurement_type"] = meta.get("procurement_type", "")
                         rec["user_item_type"]   = meta.get("user_item_type", "")
                         rec["pace_or_dash"]     = meta.get("pace_or_dash", "")
-                        rec["mlo_class"]        = meta.get("mlo_class", "")
+                        rec["mlo_class"]        = rec.get("mlo_class", "") or meta.get("mlo_class", "")
 
             finally:
                 cursor.close()
@@ -937,6 +1129,9 @@ def fetch_where_used_parents_only(
 def fetch_where_used_level1_fast(
     obs_parts: list[str],
     plant: str = "4070",
+    retain_9024: bool = True,
+    retain_esw: bool = True,
+    retain_above_cfg: bool = True,
     log_callback=None,
 ) -> list[dict[str, Any]]:
     """Fast path for single-level where-used (L1 only) with minimal overhead.
@@ -1075,7 +1270,43 @@ def fetch_where_used_level1_fast(
                         rec_out.setdefault("mlo_class", "")
                         rec_out.setdefault("designator", "")
                         rec_out.setdefault("option_class", "")
+                        if _should_drop_parent_row(
+                            parent,
+                            1,
+                            retain_9024=retain_9024,
+                            retain_esw=retain_esw,
+                        ):
+                            continue
                         records.append(rec_out)
+
+                # Fill item status and other metadata in one batch so the UI's
+                # Item Status column is populated even on the fast level-1 path.
+                all_parts = list(dict.fromkeys(
+                    r["part"] for r in records if r.get("part")
+                ))
+                if all_parts:
+                    _tm = _time.perf_counter()
+                    mr, mc = _run_query_in_chunks(
+                        cursor,
+                        _SQL_METADATA_BATCH,
+                        all_parts,
+                        safe_plant,
+                    )
+                    _log(f"[{_time.strftime('%H:%M:%S')}] Metadata fetch done in {_time.perf_counter() - _tm:.1f}s.")
+                    meta_map: dict[str, dict[str, Any]] = {}
+                    for mrow in mr:
+                        md = {
+                            col: ("" if val is None else str(val).strip())
+                            for col, val in zip(mc, mrow)
+                        }
+                        meta_map[md["part"].upper()] = md
+                    for rec in records:
+                        meta = meta_map.get(str(rec.get("part", "")).upper(), {})
+                        rec["item_status"] = meta.get("item_status", "")
+                        rec["procurement_type"] = meta.get("procurement_type", "")
+                        rec["user_item_type"] = meta.get("user_item_type", "")
+                        rec["pace_or_dash"] = meta.get("pace_or_dash", "")
+                        rec["mlo_class"] = rec.get("mlo_class", "") or meta.get("mlo_class", "")
 
             finally:
                 cursor.close()

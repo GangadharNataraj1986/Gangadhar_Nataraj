@@ -51,11 +51,6 @@ except ImportError:
     build_supply_chain_report = None
 
 try:
-    from Watch_List import WatchListTab
-except ImportError:
-    WatchListTab = None
-
-try:
     from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
     from matplotlib.figure import Figure
     _HAS_MATPLOTLIB = True
@@ -571,9 +566,7 @@ class OBSPartsTab(QWidget):
         title_row=QHBoxLayout()
         title=QLabel("Final OBS List"); title.setFont(QFont("Segoe UI",14,QFont.Weight.DemiBold)); title.setStyleSheet("color:#C1272D;")
         btn_template=QPushButton("Download Template")
-        btn_upload=QPushButton("Upload OBS List")
-        btn_export_obs=QPushButton("Export OBS List")
-        btn_export_obs.setToolTip("Export the OBS table (including Proposed Replacement column) to an Excel file")
+        btn_upload=QPushButton("Upload Template")
         # New copy buttons
         btn_copy_obs=QPushButton("Copy OBS Parts")
         btn_copy_rep=QPushButton("Copy Repl Parts")
@@ -582,19 +575,12 @@ class OBSPartsTab(QWidget):
         title_row.addStretch(1)
         title_row.addWidget(btn_template)
         title_row.addWidget(btn_upload)
-        title_row.addWidget(btn_export_obs)
         title_row.addWidget(btn_copy_obs)
         title_row.addWidget(btn_copy_rep)
         select_all_btn = QPushButton(" Select All")
         select_all_btn.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DialogApplyButton))
         select_all_btn.setToolTip("Toggle select / unselect all rows")
-        btn_approve_replacement = QPushButton("Approve replacement for selected parts")
-        btn_approve_replacement.setToolTip(
-            "Copy Proposed Replacement values into the Replacement column for checked rows.\n"
-            "If no rows are checked, prompts to accept all proposed replacements."
-        )
         title_row.addWidget(select_all_btn)
-        title_row.addWidget(btn_approve_replacement)
         title_row.addWidget(delete_btn)
         outer.addLayout(title_row)
 
@@ -627,8 +613,6 @@ class OBSPartsTab(QWidget):
         btn_copy_obs.clicked.connect(self.copy_obs_parts)
         btn_copy_rep.clicked.connect(self.copy_replacement_parts)
         select_all_btn.clicked.connect(self.toggle_select_all)
-        btn_approve_replacement.clicked.connect(self.approve_proposed_replacements)
-        btn_export_obs.clicked.connect(self.export_obs_list)
         # (WU controls moved to Where Used tab)
         self.where_used_tab = None  # linked by MainWindow after both tabs are created
 
@@ -697,60 +681,6 @@ class OBSPartsTab(QWidget):
         except Exception as e:
             QMessageBox.warning(self,'Upload Error',str(e))
 
-    def export_obs_list(self):
-        """Export the OBS table as-is (including Proposed Replacement if present) to Excel."""
-        try:
-            import pandas as pd
-            t = self.table
-            col_count = t.columnCount()
-            row_count = t.rowCount()
-
-            # Collect headers (skip the Select checkbox column at index 0)
-            headers = []
-            col_indices = []
-            for c in range(col_count):
-                if c == 0:
-                    continue
-                h = t.horizontalHeaderItem(c)
-                headers.append(h.text().strip() if h else f'Col{c}')
-                col_indices.append(c)
-
-            # Collect data rows — skip rows with no OBS part value
-            data_rows = []
-            obs_col_local = next(
-                (i for i, h in enumerate(headers) if h.strip().lower() == 'obs parts'), -1
-            )
-            for r in range(row_count):
-                row_data = []
-                for c in col_indices:
-                    if c == 2:  # Change combo
-                        w = t.cellWidget(r, c)
-                        val = w.currentText() if isinstance(w, QComboBox) else ''
-                    else:
-                        it = t.item(r, c)
-                        val = it.text().strip() if it else ''
-                    row_data.append(val)
-                # Skip entirely empty rows
-                if obs_col_local >= 0 and not row_data[obs_col_local].strip():
-                    continue
-                data_rows.append(row_data)
-
-            if not data_rows:
-                QMessageBox.information(self, 'Export OBS List', 'No data to export.')
-                return
-
-            df = pd.DataFrame(data_rows, columns=headers)
-            path, _ = QFileDialog.getSaveFileName(
-                self, 'Export OBS List', 'OBS_List.xlsx', 'Excel Files (*.xlsx)'
-            )
-            if not path:
-                return
-            with pd.ExcelWriter(path, engine='openpyxl') as writer:
-                df.to_excel(writer, index=False, sheet_name='OBS List')
-            QMessageBox.information(self, 'Export Complete', f'OBS List exported to:\n{path}')
-        except Exception as e:
-            QMessageBox.warning(self, 'Export Error', str(e))
-
     # NEW: Copy helpers
     def _collect_column_values(self, col_index: int) -> List[str]:
         t=self.table
@@ -795,122 +725,6 @@ class OBSPartsTab(QWidget):
 
     def reset(self):
         t=self.table; t.setRowCount(10); t._init_rows(0,10)
-
-    def approve_proposed_replacements(self):
-        """Copy Proposed Replacement → Replacement for selected rows (or all if none selected)."""
-        t = self.table
-
-        # Locate required columns
-        prop_col = -1
-        repl_col = -1
-        obs_col = -1
-        for c in range(t.columnCount()):
-            h = t.horizontalHeaderItem(c)
-            if h:
-                txt = h.text().strip().lower()
-                if txt == 'proposed replacement':
-                    prop_col = c
-                elif txt == 'replacement':
-                    repl_col = c
-                elif txt == 'obs parts':
-                    obs_col = c
-
-        if prop_col < 0:
-            QMessageBox.information(self, 'No Proposed Replacements',
-                'No "Proposed Replacement" column found.\n'
-                'Run the orphan analysis to generate proposed replacements first.')
-            return
-        if repl_col < 0:
-            QMessageBox.warning(self, 'Error', 'Could not find "Replacement" column.')
-            return
-
-        # Determine which rows the user has checked
-        selected_rows = []
-        for r in range(t.rowCount()):
-            w = t.cellWidget(r, 0)
-            if w:
-                cb = w.findChild(QCheckBox)
-                if cb and cb.isChecked():
-                    selected_rows.append(r)
-
-        if selected_rows:
-            rows_to_process = selected_rows
-        else:
-            reply = QMessageBox.question(
-                self, 'Confirm Approve All',
-                'Accept all proposed replacements as Valid Replacements for the Identified Orphans.',
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No
-            )
-            if reply != QMessageBox.StandardButton.Yes:
-                return
-            rows_to_process = list(range(t.rowCount()))
-
-        # Apply proposed → replacement and build a map for Where Used update
-        accepted_map: Dict[str, str] = {}  # upper(part_number) -> replacement_value
-        for r in rows_to_process:
-            prop_item = t.item(r, prop_col)
-            prop_val = prop_item.text().strip() if prop_item else ''
-            if not prop_val:
-                continue
-            repl_item = t.item(r, repl_col)
-            if repl_item is None:
-                repl_item = QTableWidgetItem('')
-                t.setItem(r, repl_col, repl_item)
-            repl_item.setText(prop_val)
-            if obs_col >= 0:
-                obs_item = t.item(r, obs_col)
-                part_num = obs_item.text().strip() if obs_item else ''
-                if part_num:
-                    accepted_map[part_num.upper()] = prop_val
-
-        if not accepted_map:
-            QMessageBox.information(self, 'Nothing to Accept',
-                'No non-empty proposed replacement values found for the selected rows.')
-            return
-
-        # Check whether ALL rows that have a proposed value were processed
-        rows_to_process_set = set(rows_to_process)
-        all_accepted = all(
-            r in rows_to_process_set
-            for r in range(t.rowCount())
-            if (t.item(r, prop_col) and t.item(r, prop_col).text().strip())
-        )
-
-        if all_accepted:
-            t.removeColumn(prop_col)
-
-        # Update Where Used tab if available
-        if self.where_used_tab is not None and accepted_map:
-            wu_table = self.where_used_tab.table
-            if (wu_table is not None
-                    and wu_table.rowCount() > 0
-                    and wu_table.columnCount() > 0):
-                wu_part_col = -1
-                wu_repl_col = -1
-                for c in range(wu_table.columnCount()):
-                    h = wu_table.horizontalHeaderItem(c)
-                    if h:
-                        txt = h.text().strip().lower()
-                        if txt in ('part', 'part number', 'material number'):
-                            wu_part_col = c
-                        elif txt == 'replacement':
-                            wu_repl_col = c
-                if wu_part_col >= 0 and wu_repl_col >= 0:
-                    for r in range(wu_table.rowCount()):
-                        part_item = wu_table.item(r, wu_part_col)
-                        part_val = part_item.text().strip().upper() if part_item else ''
-                        if part_val in accepted_map:
-                            repl_item = wu_table.item(r, wu_repl_col)
-                            if repl_item is None:
-                                repl_item = QTableWidgetItem('')
-                                wu_table.setItem(r, wu_repl_col, repl_item)
-                            repl_item.setText(accepted_map[part_val])
-
-        QMessageBox.information(
-            self, 'Update Complete',
-            'Replacement update completed. Please proceed to the next level of Orphan Analysis.'
-        )
 
     def launch_where_used_import(self):
         """Validate WU level + OBS parts, then delegate to the linked Where Used tab."""
@@ -1494,14 +1308,7 @@ class WhereUsedTab(QWidget):
 
         # ── Query Databricks ───────────────────────────────────────────────────
         try:
-            records = fetch_where_used(
-                obs_parts,
-                max_level,
-                plant,
-                retain_9024=retain_9024,
-                retain_esw=retain_esw,
-                retain_above_cfg=retain_above_cfg,
-            )
+            records = fetch_where_used(obs_parts, max_level, plant)
             self.raw_databricks_records = records.copy() if isinstance(records, list) else None
         except Exception as exc:
             QMessageBox.warning(self, 'Databricks Query Error', str(exc))
@@ -1517,6 +1324,82 @@ class WhereUsedTab(QWidget):
 
         # ── Build OBS map for Replacement column ──────────────────────────────
         obs_map = self._build_obs_map()
+
+        # --- Filter records based on radio selections ---
+        # Keep this in sync with V2 button behavior:
+        #   - 9024 remove == "Select all 9024 Parents" + delete
+        #   - ESW remove  == "Select ESW Parents" + delete
+        #   - SmBOM remove == "Select above Config" + delete
+        config_prefixes = {
+            '0490','0491','0495','0497','0430','0350','0355','0351','0357',
+            '0390','0395','0397','0335','0391','0431','0435','0437',
+            '0440','0445','0455','0450','0441','0447','0457',
+            '0460','0465','0461','0467','0410','0415','0417',
+            '0411','0412','0413','0414','0360','0365','0361','0367'
+        }
+        listing_prefixes = {'0243', '0288', '0289', '0290'}
+        prune_anchor_prefixes = config_prefixes | listing_prefixes
+
+        def _wu_level_int(rec: Dict[str, Any]) -> int:
+            raw = (rec.get('wu_level') if isinstance(rec, dict) else None)
+            try:
+                return int(str(raw).strip())
+            except Exception:
+                return -1
+
+        remove_idx = set()
+
+        # 9024 filter: remove parent rows with 9024 prefix when radio is set to Remove
+        if not retain_9024:
+            for i, rec in enumerate(records):
+                part = (rec.get('part') or '').strip()
+                replacement = (rec.get('replacement') or '').strip()
+                if part.startswith('9024') and _wu_level_int(rec) != 0:
+                    if not replacement:  # Only remove if Replacement is blank
+                        remove_idx.add(i)
+
+        # ESW filter: remove parent rows with ESW prefix when radio is set to Remove
+        if not retain_esw:
+            for i, rec in enumerate(records):
+                part = (rec.get('part') or '').strip().upper()
+                replacement = (rec.get('replacement') or '').strip()
+                if part.startswith('ESW') and _wu_level_int(rec) != 0:
+                    if not replacement:  # Only remove if Replacement is blank
+                        remove_idx.add(i)
+
+        # SmBOM-above-config filter when radio is set to Remove
+        if not retain_above_cfg:
+            n = len(records)
+            r = 0
+            while r < n:
+                lvl = _wu_level_int(records[r])
+                if lvl == 0:
+                    block_start = r
+                    block_end = n
+                    for i in range(r + 1, n):
+                        if _wu_level_int(records[i]) == 0:
+                            block_end = i
+                            break
+
+                    for i in range(block_start + 1, block_end):
+                        part_i = (records[i].get('part') or '').strip()
+                        lvl_i = _wu_level_int(records[i])
+                        replacement_i = (records[i].get('replacement') or '').strip()
+                        if part_i[:4] in prune_anchor_prefixes and lvl_i != 0:
+                            if not replacement_i:  # Only remove if Replacement is blank
+                                for j in range(i + 1, block_end):
+                                    lvl_j = _wu_level_int(records[j])
+                                    replacement_j = (records[j].get('replacement') or '').strip()
+                                    if lvl_j <= lvl_i:
+                                        break
+                                    if lvl_j != 0 and not replacement_j:  # Only remove if Replacement is blank
+                                        remove_idx.add(j)
+                    r = block_end
+                else:
+                    r += 1
+
+        if remove_idx:
+            records = [rec for idx, rec in enumerate(records) if idx not in remove_idx]
 
         # ── Column layout ──────────────────────────────────────────────────────
         # all_headers: [Select=0, WU Level=1, Part=2, Replacement=3, Rev/Ln=4, ...]
@@ -1816,19 +1699,9 @@ class WhereUsedTabV2(WhereUsedTab):
         Kits/Assemblies are always selected. Options/Option Class selection is
         user-controlled via prompt + checkboxes.
         """
-        config_prefixes = {
-            '0490','0491','0495','0497','0430','0350','0355','0351','0357',
-            '0390','0395','0397','0335','0391','0431','0435','0437',
-            '0440','0445','0455','0450','0441','0447','0457',
-            '0460','0465','0461','0467','0410','0415','0417',
-            '0411','0412','0413','0414','0360','0365','0361','0367'
-        }
-        listing_prefixes = {'0243', '0288', '0289', '0290'}
-
         part_col = self._v2_find_table_col_index('Part')
         wu_col = self._v2_find_table_col_contains('wu level')
         option_class_col = self._v2_find_table_col_contains('option class')
-        mlo_class_col = self._v2_find_table_col_contains('mlo class')
         if part_col < 0 or wu_col < 0:
             QMessageBox.information(
                 self,
@@ -1836,6 +1709,14 @@ class WhereUsedTabV2(WhereUsedTab):
                 "Couldn't find required 'Part' and 'WU Level' columns.",
             )
             return
+
+        config_prefixes = {
+            '0490','0491','0495','0497','0430','0350','0355','0351','0357',
+            '0390','0395','0397','0335','0391','0431','0435','0437',
+            '0440','0445','0455','0450','0441','0447','0457',
+            '0460','0465','0461','0467','0410','0415','0417',
+            '0411','0412','0413','0414','0360','0365','0361','0367'
+        }
 
         def _meta(row_idx: int):
             p_raw = (self.table.item(row_idx, part_col).text() if self.table.item(row_idx, part_col) else '') or ''
@@ -1846,26 +1727,16 @@ class WhereUsedTabV2(WhereUsedTab):
             except Exception:
                 lvl = -1
             oc_txt = ''
-            mlo_txt = ''
             if option_class_col >= 0:
                 oc_item = self.table.item(row_idx, option_class_col)
                 oc_txt = (oc_item.text() if oc_item else '') or ''
-            if mlo_class_col >= 0:
-                mlo_item = self.table.item(row_idx, mlo_class_col)
-                mlo_txt = (mlo_item.text() if mlo_item else '') or ''
-            return p_trim, lvl, oc_txt, mlo_txt
+            return p_trim, lvl, oc_txt
 
-        def _option_kind(option_class_text: str, mlo_class_text: str):
-            oc = (option_class_text or '').strip().upper()
-            mlo = (mlo_class_text or '').strip().upper()
-
-            # MLO Class like "Class 1/2/3" should be treated as Options only.
-            if re.search(r'\bCLASS\s*[123]\b', mlo):
-                return 'options'
-
-            if ('OPTION CLASS' in oc) or ('O CLASS' in oc):
+        def _option_kind(oc_text: str):
+            t = (oc_text or '').strip().upper()
+            if 'OPTION CLASS' in t or 'O CLASS' in t:
                 return 'option_class'
-            if 'OPTION' in oc:
+            if 'OPTION' in t:
                 return 'options'
             return 'unknown'
 
@@ -1877,7 +1748,7 @@ class WhereUsedTabV2(WhereUsedTab):
 
         r = 0
         while r < rows_total:
-            _, lvl_r, _, _ = _meta(r)
+            _, lvl_r, _ = _meta(r)
             if lvl_r != 0:
                 r += 1
                 continue
@@ -1885,22 +1756,18 @@ class WhereUsedTabV2(WhereUsedTab):
             block_start = r
             block_end = rows_total
             for i in range(r + 1, rows_total):
-                _, lvl_i, _, _ = _meta(i)
+                _, lvl_i, _ = _meta(i)
                 if lvl_i == 0:
                     block_end = i
                     break
 
             seen_config = False
             for i in range(block_start + 1, block_end):
-                part_i, lvl_i, oc_i, mlo_i = _meta(i)
+                part_i, lvl_i, oc_i = _meta(i)
                 if lvl_i <= 0:
                     continue
 
-                # Listing commodity rows are always excluded from selection.
-                if part_i[:4] in listing_prefixes:
-                    continue
-
-                is_config_or_option = (part_i[:4] in config_prefixes) or (_option_kind(oc_i, mlo_i) != 'unknown')
+                is_config_or_option = (part_i[:4] in config_prefixes) or (_option_kind(oc_i) != 'unknown')
                 if is_config_or_option:
                     seen_config = True
 
@@ -1908,7 +1775,7 @@ class WhereUsedTabV2(WhereUsedTab):
                     kits_rows.add(i)
                     continue
 
-                kind = _option_kind(oc_i, mlo_i)
+                kind = _option_kind(oc_i)
                 if kind == 'options':
                     options_rows.add(i)
                 elif kind == 'option_class':
@@ -5158,10 +5025,11 @@ class InventoryCostTab(QWidget):
         super().__init__()
         v = QVBoxLayout(self)
         h = QHBoxLayout()
+        self.btn_import = QPushButton('Import MM360 & Create Inventory & Cost')
         self.btn_import_db = QPushButton('Import from Databricks')
         self.btn_export = QPushButton('Export Excel')
         self.btn_reset = QPushButton('Reset Tab')
-        for b in (self.btn_import_db, self.btn_export, self.btn_reset):
+        for b in (self.btn_import, self.btn_import_db, self.btn_export, self.btn_reset):
             h.addWidget(b)
         h.addSpacing(16)
         h.addWidget(QLabel('Cholesterol View:'))
@@ -5213,6 +5081,7 @@ class InventoryCostTab(QWidget):
         self.subtabs.addTab(self.charts_tab, 'Charts')
         v.addWidget(self.subtabs)
         self.df = None
+        self.btn_import.clicked.connect(self.import_mm360)
         self.btn_import_db.clicked.connect(self.import_databricks)
         self.btn_export.clicked.connect(self.export_excel)
         self.btn_reset.clicked.connect(self.reset_tab)
@@ -5338,6 +5207,63 @@ class InventoryCostTab(QWidget):
         except Exception:
             pass
         return obs_map
+
+    def import_mm360(self):
+        path,_ = QFileDialog.getOpenFileName(self,'Open MM360','', 'Excel Files (*.xlsx)')
+        if not path: return
+        src = pd.read_excel(path, sheet_name='Material Analysis', engine='openpyxl')
+
+        def pace(v):
+            v=str(v)
+            if v.startswith('SGP'): return 'PACE'
+            if v.startswith('GDS'): return 'DASH'
+            return ''
+        src['PACE/DASH'] = src['MRP Profile'].apply(pace)
+
+        obs_map = self._build_obs_replacement_map()
+        rows=[]
+        for (pn,desc,pdsh), g in src.groupby(['Material Number','Material Description','PACE/DASH']):
+            code4=str(pn)[:4]
+            prim=sec=''
+            if code4 in NO_CDW_CODES:
+                prim=sec='No Change Required'
+            rep = obs_map.get(str(pn).strip().upper(), '')
+            row={
+                'Material Number':pn,
+                'Material Description':desc,
+                'Replacement Part':rep,
+                'Primary Disposition':prim,
+                'Secondary Disposition':sec,
+                'PACE/DASH':pdsh
+            }
+            tot_on=tot_oh=tot_d13=tot_d26=tot_d52=tot_cost=0.0
+            for p in PLANTS:
+                gp = g[g['Plant Code'] == p]
+                oo = float(gp['On Order Quantity'].sum()) if not gp.empty else 0
+                oh = float(gp['onhand'].sum()) if not gp.empty else 0
+                d13 = float(gp['Gross Demand-13'].sum()) if not gp.empty else 0
+                d26 = float(gp['Gross Demand-26'].sum()) if not gp.empty else 0
+                d52 = float(gp['Gross Demand-52'].sum()) if not gp.empty else 0
+                # AGS columns: if not present, set to 0
+                ags_oo = float(gp['AGS On-Order'].sum()) if 'AGS On-Order' in gp.columns and not gp.empty else 0
+                ags_oh = float(gp['AGS On-Hand'].sum()) if 'AGS On-Hand' in gp.columns and not gp.empty else 0
+                ags_d52 = float(gp['AGS 6M Gross Demand'].sum()) if 'AGS 6M Gross Demand' in gp.columns and not gp.empty else 0
+                sc = float(gp['Standard Cost USD'].iloc[0]) if (oh > 0 or oo > 0) else 0
+                row[f'{p} On Order Qty'] = oo
+                row[f'{p} Onhand Qty'] = oh
+                row[f'{p} Gross Demand-13'] = d13
+                row[f'{p} Gross Demand-26'] = d26
+                row[f'{p} Gross Demand-52'] = d52
+                row[f'{p} AGS On-Order'] = ags_oo
+                row[f'{p} AGS On-Hand'] = ags_oh
+                row[f'{p} AGS 6M Gross Demand'] = ags_d52
+                row[f'{p} Standard Cost USD'] = sc
+                tot_on += oo; tot_oh += oh
+                tot_d13 += d13; tot_d26 += d26; tot_d52 += d52
+                tot_cost += (oh + oo) * sc
+        self.df=pd.DataFrame(rows).sort_values('Inventory Cost',ascending=False)
+        self.render()
+        self._refresh_report_tab()
 
     def import_databricks(self):
         """Import inventory, demand, and cost data from Databricks for OBS parts."""
@@ -5472,13 +5398,6 @@ class InventoryCostTab(QWidget):
             self.df = pd.DataFrame(rows).sort_values('Inventory Cost', ascending=False)
             self.render()
             self._refresh_report_tab()
-            try:
-                main = self.window()
-                watch_tab = getattr(main, 'watch_list_tab', None)
-                if watch_tab is not None and hasattr(watch_tab, 'refresh_from_sources'):
-                    watch_tab.refresh_from_sources(show_message=False)
-            except Exception:
-                pass
             QMessageBox.information(self, 'Success', f'Loaded {len(rows)} OBS part(s) from Databricks.')
         except Exception as e:
             QMessageBox.warning(self, 'Import Error', f'Error importing from Databricks: {str(e)}')
@@ -6100,142 +6019,48 @@ class ReportTab(QWidget):
             QMessageBox.information(self, 'Report', status_text)
 
     def render(self):
+        if self.df is None or self.df.empty:
+            self.report_text.setPlainText('No actionable recommendations are available for the current selection.')
+            return
+
         lines: list[str] = []
-        sl_col_width = 12
+        # Group by Part only, ignore Plant
+        grouped = self.df.sort_values(['Part', 'Recommended Action']).groupby('Part', dropna=False)
+        for part, group in grouped:
+            part = str(part or '').strip()
+            if not part:
+                continue
+            # Get summary values from the first row (all rows for this part have same totals)
+            first_row = group.iloc[0]
+            total_inv = self._fmt_num(first_row.get('Total Inventory', ''))
+            total_demand = self._fmt_num(first_row.get('Total Demand', ''))
+            total_excess = self._fmt_num(first_row.get('Excess Quantity', ''))
+            lines.append(f"{part} / {total_inv} - {total_demand} = {total_excess}")
 
-        def _sl_line(sl_no: int | str, text: str) -> str:
-            prefix = f"{sl_no}." if isinstance(sl_no, int) else str(sl_no)
-            return f"{prefix:<{sl_col_width}}{text}"
+            # Prepare recommendations for this part
+            rec_lines = []
+            rec_idx = 1
+            for _, row in group.iterrows():
+                action = str(row.get('Recommended Action', '') or '').strip()
+                if action == 'Cancel PO':
+                    po_number = str(row.get('PO Number', '') or '').strip()
+                    supplier = str(row.get('Supplier Name', '') or '').strip()
+                    qty = self._fmt_num(row.get('PO Qty', ''))
+                    delivery = self._fmt_delivery(row.get('Delivery Date', ''))
+                    rec_lines.append(f"Recommendation {rec_idx}: {po_number} / {supplier} / {qty} / {delivery} - Map the Excess Qty, with with PO Cancelation")
+                    rec_idx += 1
+                elif action == 'Sell back to CM':
+                    total_excess = self._fmt_num(row.get('Excess Quantity', ''))
+                    kit_code = str(row.get('Kit Code', '') or '').strip()
+                    rec_lines.append(f"Recommendation {rec_idx}: {total_excess} -> Sell Back Opportunity({kit_code})")
+                    rec_idx += 1
+            if not rec_lines:
+                # If no recognized recommendations, add a generic one
+                rec_lines.append("No actionable recommendation for this part.")
+            lines.extend(rec_lines)
+            lines.append("")  # Blank line between parts
 
-        sl_no = 1
-        if self.df is not None and not self.df.empty:
-            # Group by Part only, ignore Plant.
-            grouped = self.df.sort_values(['Part', 'Recommended Action']).groupby('Part', dropna=False)
-            for part, group in grouped:
-                part = str(part or '').strip()
-                if not part:
-                    continue
-
-                first_row = group.iloc[0]
-                total_inv = self._fmt_num(first_row.get('Total Inventory', ''))
-                total_demand = self._fmt_num(first_row.get('Total Demand', ''))
-                total_excess = self._fmt_num(first_row.get('Excess Quantity', ''))
-                summary = f"{part} / {total_inv} - {total_demand} = {total_excess}"
-
-                rec_lines: list[str] = []
-                for _, row in group.iterrows():
-                    action = str(row.get('Recommended Action', '') or '').strip()
-                    if action == 'Cancel PO':
-                        po_number = str(row.get('PO Number', '') or '').strip()
-                        supplier = str(row.get('Supplier Name', '') or '').strip()
-                        qty = self._fmt_num(row.get('PO Qty', ''))
-                        delivery = self._fmt_delivery(row.get('Delivery Date', ''))
-                        rec_lines.append(f"{po_number} / {supplier} / {qty} / {delivery} - Map the Excess Qty, with PO Cancellation")
-                    elif action == 'Sell back to CM':
-                        exc_qty = self._fmt_num(row.get('Excess Quantity', ''))
-                        kit_code = str(row.get('Kit Code', '') or '').strip()
-                        rec_lines.append(f"{exc_qty} -> Sell Back Opportunity({kit_code})")
-
-                if not rec_lines:
-                    rec_lines.append('Provide Disposition Plan for this Excess Inventory.')
-
-                lines.append(_sl_line(sl_no, f"{summary}: {rec_lines[0]}"))
-                for extra in rec_lines[1:]:
-                    lines.append(_sl_line('', extra))
-                sl_no += 1
-        else:
-            lines.append(_sl_line(sl_no, 'No actionable recommendations are available for the current selection.'))
-            sl_no += 1
-
-        main = self.window()
-        watch_tab = getattr(main, 'watch_list_tab', None)
-        watch_entries = self._collect_watch_list_entries(watch_tab)
-        if watch_entries:
-            lines.append('')
-            lines.append(_sl_line(sl_no, 'Add Below Parts to Watch List'))
-            sl_no += 1
-            for part, reason in watch_entries:
-                if reason:
-                    lines.append(_sl_line('', f"{part} - {reason}"))
-                else:
-                    lines.append(_sl_line('', part))
-
-        header = f"{'Sl. No,':<{sl_col_width}}Recommendation"
-        body_text = '\n'.join(lines).rstrip()
-        html_out = (
-            "<pre style=\"font-family:'Consolas','Courier New',monospace;font-size:12pt;margin:0;\">"
-            f"<b>{html.escape(header)}</b>\n"
-            f"{html.escape(body_text)}"
-            "</pre>"
-        )
-        self.report_text.setHtml(html_out)
-
-    def _collect_watch_list_entries(self, watch_tab: Any) -> list[tuple[str, str]]:
-        """Read visible Watch_List rows (table first, dataframe fallback) for report output."""
-        if watch_tab is None:
-            return []
-
-        reason_headers = {'reason to add in watch list', 'watch list rule'}
-        part_headers = {'material number', 'part', 'part number'}
-
-        def _norm(v: Any) -> str:
-            return str(v or '').strip()
-
-        entries: list[tuple[str, str]] = []
-        seen_parts: set[str] = set()
-
-        # 1) Prefer reading from the Watch_List table so report reflects exactly what user sees.
-        table = getattr(watch_tab, 'table', None)
-        if isinstance(table, QTableWidget) and table.columnCount() > 0:
-            col_names = [_norm(table.horizontalHeaderItem(c).text() if table.horizontalHeaderItem(c) else '') for c in range(table.columnCount())]
-            part_idx = next((i for i, name in enumerate(col_names) if name.lower() in part_headers), None)
-            reason_idx = next((i for i, name in enumerate(col_names) if name.lower() in reason_headers), None)
-
-            if part_idx is not None:
-                for r in range(table.rowCount()):
-                    part_item = table.item(r, part_idx)
-                    part = _norm(part_item.text() if part_item else '')
-                    if not part:
-                        continue
-                    part_key = part.upper()
-                    if part_key in seen_parts:
-                        continue
-                    seen_parts.add(part_key)
-
-                    reason = ''
-                    if reason_idx is not None:
-                        reason_item = table.item(r, reason_idx)
-                        reason = _norm(reason_item.text() if reason_item else '')
-                    entries.append((part, reason))
-
-        # 2) Fallback to dataframe if table didn't provide entries.
-        if entries:
-            return entries
-
-        watch_df = getattr(watch_tab, 'df', None)
-        if isinstance(watch_df, pd.DataFrame) and not watch_df.empty:
-            reason_col = 'Reason to add in Watch List'
-            part_col = 'Material Number'
-            if reason_col not in watch_df.columns and 'Watch List Rule' in watch_df.columns:
-                reason_col = 'Watch List Rule'
-            if part_col not in watch_df.columns:
-                for candidate in ('Part', 'Part Number'):
-                    if candidate in watch_df.columns:
-                        part_col = candidate
-                        break
-
-            for _, row in watch_df.iterrows():
-                part = _norm(row.get(part_col, ''))
-                if not part:
-                    continue
-                part_key = part.upper()
-                if part_key in seen_parts:
-                    continue
-                seen_parts.add(part_key)
-                reason = _norm(row.get(reason_col, ''))
-                entries.append((part, reason))
-
-        return entries
+        self.report_text.setPlainText('\n'.join(line for line in lines).strip())
 
     def _sentence_from_row(self, row: pd.Series, include_supplier: bool = True) -> str:
         part = str(row.get('Part', '') or '').strip()
@@ -6411,30 +6236,6 @@ class OrphanOBSSubTab(QWidget):
         return max_level
 
     def _import_bom_repl_parts(self):
-        # Ensure all listed OBS parts have an explicit replacement entry before import.
-        main = self.window()
-        obs_tab = getattr(main, 'obs_tab', None)
-        missing_replacements = []
-        if obs_tab and hasattr(obs_tab, 'table'):
-            t = obs_tab.table
-            for r in range(t.rowCount()):
-                obs_it = t.item(r, 1)
-                rep_it = t.item(r, 3)
-                obs_val = (obs_it.text() if obs_it else '').strip()
-                rep_val = (rep_it.text() if rep_it else '').strip()
-                if obs_val and not rep_val:
-                    missing_replacements.append(obs_val)
-        if missing_replacements:
-            preview = ', '.join(missing_replacements[:10])
-            suffix = '' if len(missing_replacements) <= 10 else f' ... (+{len(missing_replacements) - 10} more)'
-            QMessageBox.warning(
-                self,
-                'Update Replacements Required',
-                'Please update the Replacement column for OBS Parts before using Import BOM of REPL Parts.\n\n'
-                f'Missing replacements for: {preview}{suffix}'
-            )
-            return
-
         # Collect Replacement parts from the OBS Parts tab (column 3)
         main = self.window()
         obs_tab = getattr(main, 'obs_tab', None)
@@ -6948,14 +6749,9 @@ class WURemovedBOMItemsTab(QWidget):
             for r in range(t.rowCount()):
                 if t.item(r, insert_at) is None:
                     t.setItem(r, insert_at, QTableWidgetItem(''))
+            return insert_at
 
-        # Apply a wider width for better visibility (20 chars equivalent)
-        try:
-            px = _excel_width_to_px(t, 20)
-            t.setColumnWidth(insert_at, px)
-        except Exception:
-            pass
-        return insert_at
+        return existing_idx
 
     @staticmethod
     def _norm_desc(value: str) -> str:
@@ -7212,11 +7008,8 @@ class WURemovedBOMItemsTab(QWidget):
         self.prompt_replacement_update_for_orphans = False
         outer = QVBoxLayout(self)
 
-        # ── Controls rows (split to avoid overlap on narrower screens) ───────
-        top_row = QHBoxLayout()
-        top_row.setSpacing(8)
-        bottom_row = QHBoxLayout()
-        bottom_row.setSpacing(10)
+        # ── Button row ────────────────────────────────────────────────────────
+        btn_row = QHBoxLayout()
         wu_lbl = QLabel("WU Level (1-6):")
         self.wu_level_input = QLineEdit()
         self.wu_level_input.setFixedWidth(45)
@@ -7231,22 +7024,12 @@ class WURemovedBOMItemsTab(QWidget):
         self.plant_combo.setFixedWidth(70)
         self.plant_combo.setToolTip("Plant code to filter the WU query")
 
-        self.btn_import = QPushButton("Import WU - Rem Items")
+        self.btn_import = QPushButton("Import WU – Rem Items")
         self.btn_analyze = QPushButton("Run Orphan Analysis")
-        self.btn_append_selected = QPushButton("Append Orphan Parents to OBS List")
+        self.btn_append_selected = QPushButton("Append to OBS List")
         self.btn_reset = QPushButton("Reset")
 
-        # Keep button labels readable when the row is dense.
-        self.btn_import.setMinimumWidth(170)
-        self.btn_analyze.setMinimumWidth(165)
-        self.btn_append_selected.setMinimumWidth(255)
-
         def _add_parent_radio_group(layout, label_text, group_attr, retain_attr, remove_attr):
-            grp_box = QWidget()
-            grp_layout = QHBoxLayout(grp_box)
-            grp_layout.setContentsMargins(0, 0, 0, 0)
-            grp_layout.setSpacing(6)
-
             lbl = QLabel(f"<b>{label_text}</b>")
             grp = QButtonGroup(self)
             grp.setExclusive(True)
@@ -7257,39 +7040,38 @@ class WURemovedBOMItemsTab(QWidget):
             grp.addButton(rb_retain, 0)
             grp.addButton(rb_remove, 1)
             rb_remove.setChecked(True)   # default: Remove
-
-            grp_layout.addWidget(lbl)
-            grp_layout.addWidget(rb_retain)
-            grp_layout.addWidget(rb_remove)
-            layout.addWidget(grp_box)
-
+            layout.addWidget(lbl)
+            layout.addWidget(rb_retain)
+            layout.addWidget(rb_remove)
             setattr(self, group_attr, grp)
             setattr(self, retain_attr, rb_retain)
             setattr(self, remove_attr, rb_remove)
 
-        top_row.addWidget(wu_lbl)
-        top_row.addWidget(self.wu_level_input)
-        top_row.addWidget(plant_lbl)
-        top_row.addWidget(self.plant_combo)
-        top_row.addWidget(self.btn_import)
-        top_row.addWidget(self.btn_analyze)
-        top_row.addWidget(self.btn_append_selected)
-        top_row.addStretch(1)
-        self.btn_reset.setMinimumWidth(110)
-        top_row.addWidget(self.btn_reset)
-        outer.addLayout(top_row)
+        btn_row.addWidget(wu_lbl)
+        btn_row.addWidget(self.wu_level_input)
+        btn_row.addWidget(plant_lbl)
+        btn_row.addWidget(self.plant_combo)
+        btn_row.addWidget(self.btn_import)
+        btn_row.addWidget(self.btn_analyze)
+        btn_row.addWidget(self.btn_append_selected)
 
-        _add_parent_radio_group(bottom_row, "9024 Parents:", 'radio_9024_group', 'radio_9024_retain', 'radio_9024_remove')
-        _add_parent_radio_group(bottom_row, "ESW Parents:", 'radio_esw_group', 'radio_esw_retain', 'radio_esw_remove')
-        _add_parent_radio_group(
-            bottom_row,
-            "SmBOM above Config:",
-            'radio_above_cfg_group',
-            'radio_above_cfg_retain',
-            'radio_above_cfg_remove',
-        )
-        bottom_row.addStretch(1)
-        outer.addLayout(bottom_row)
+        sep_9024 = QFrame()
+        sep_9024.setFrameShape(QFrame.Shape.VLine)
+        sep_9024.setFrameShadow(QFrame.Shadow.Sunken)
+        sep_9024.setLineWidth(1)
+        btn_row.addWidget(sep_9024)
+        _add_parent_radio_group(btn_row, "9024 Parents:", 'radio_9024_group', 'radio_9024_retain', 'radio_9024_remove')
+
+        sep_esw = QFrame()
+        sep_esw.setFrameShape(QFrame.Shape.VLine)
+        sep_esw.setFrameShadow(QFrame.Shadow.Sunken)
+        sep_esw.setLineWidth(1)
+        btn_row.addWidget(sep_esw)
+        _add_parent_radio_group(btn_row, "ESW Parents:", 'radio_esw_group', 'radio_esw_retain', 'radio_esw_remove')
+
+        btn_row.addStretch(1)
+        btn_row.addWidget(self.btn_reset)
+        outer.addLayout(btn_row)
 
         self.table = QTableWidget(0, 0)
         self.table.verticalHeader().setVisible(False)
@@ -7298,7 +7080,7 @@ class WURemovedBOMItemsTab(QWidget):
 
         self.btn_import.clicked.connect(self.import_from_databricks_for_removed_items)
         self.btn_analyze.clicked.connect(self.perform_orphan_analysis)
-        self.btn_append_selected.clicked.connect(self.append_orphan_parents_to_obs_list)
+        self.btn_append_selected.clicked.connect(self.append_selected_parts_to_obs_list)
         self.btn_reset.clicked.connect(self.reset_tab)
 
     def enable_with_replacement_compare(self, replacement_bom_provider):
@@ -7308,34 +7090,36 @@ class WURemovedBOMItemsTab(QWidget):
     def configure_orphan_append_behavior(self, prompt_replacement_updates: bool = False):
         self.prompt_replacement_update_for_orphans = bool(prompt_replacement_updates)
 
-    def append_orphan_parents_to_obs_list(self):
+    def append_selected_parts_to_obs_list(self):
         if not self.obs_provider:
             return
 
         pcol = self._find_col('Part')
         ocol = self._find_col('Orphans List')
         if pcol < 0:
-            QMessageBox.information(self, 'Append Orphan Parents', "Couldn't find a 'Part' column.")
+            QMessageBox.information(self, 'Append to OBS', "Couldn't find a 'Part' column.")
             return
 
-        orphan_parents = []
+        selected = []
         for r in range(self.table.rowCount()):
-            pit = self.table.item(r, pcol)
-            if not pit:
-                continue
-            part = pit.text().strip()
-            if not part:
-                continue
+            w = self.table.cellWidget(r, 0)
+            cb = w.findChild(QCheckBox) if w else None
+            if cb and cb.isChecked():
+                pit = self.table.item(r, pcol)
+                if not pit:
+                    continue
+                part = pit.text().strip()
+                if not part:
+                    continue
+                label = 'Orphan1'
+                if ocol >= 0:
+                    oit = self.table.item(r, ocol)
+                    if oit and oit.text().strip().lower().startswith('orphan'):
+                        label = oit.text().strip()
+                selected.append((part.upper(), label))
 
-            label = ''
-            if ocol >= 0:
-                oit = self.table.item(r, ocol)
-                label = (oit.text() if oit else '').strip()
-            if label.lower() == 'orphan parent':
-                orphan_parents.append((part.upper(), label))
-
-        if not orphan_parents:
-            QMessageBox.information(self, 'Append Orphan Parents', 'No identified Orphan Parent parts found to append.')
+        if not selected:
+            QMessageBox.information(self, 'Append to OBS', 'No selected parts found to append.')
             return
 
         t = self.obs_provider.table
@@ -7346,7 +7130,7 @@ class WURemovedBOMItemsTab(QWidget):
         }
 
         added = 0
-        for part, lvl in orphan_parents:
+        for part, lvl in selected:
             if part in existing:
                 continue
             target = next((r for r in range(t.rowCount()) if not t.item(r,1) or not t.item(r,1).text().strip()), None)
@@ -7362,7 +7146,7 @@ class WURemovedBOMItemsTab(QWidget):
             existing.add(part)
             added += 1
 
-        QMessageBox.information(self, 'Append Orphan Parents', f'Appended {added} Orphan Parent part(s) to OBS List.')
+        QMessageBox.information(self, 'Append to OBS', f'Appended {added} selected part(s) to OBS List.')
 
     def reset_tab(self):
         self.table.clear()
@@ -7516,25 +7300,10 @@ class WURemovedBOMItemsTab(QWidget):
         try:
             if max_level == 1:
                 from where_used_query import fetch_where_used_level1_fast as _fwu_fast
-                records = _fwu_fast(
-                    target_parts,
-                    selected_plant,
-                    retain_9024=self.radio_9024_retain.isChecked(),
-                    retain_esw=self.radio_esw_retain.isChecked(),
-                    retain_above_cfg=self.radio_above_cfg_retain.isChecked(),
-                    log_callback=_log_cb,
-                )
+                records = _fwu_fast(target_parts, selected_plant, log_callback=_log_cb)
             else:
                 from where_used_query import fetch_where_used_parents_only as _fwu
-                records = _fwu(
-                    target_parts,
-                    max_level,
-                    selected_plant,
-                    retain_9024=self.radio_9024_retain.isChecked(),
-                    retain_esw=self.radio_esw_retain.isChecked(),
-                    retain_above_cfg=self.radio_above_cfg_retain.isChecked(),
-                    log_callback=_log_cb,
-                )
+                records = _fwu(target_parts, max_level, selected_plant, log_callback=_log_cb)
         except Exception as exc:
             _log_cb(f'[ERROR] {exc}')
             log_dialog.close()
@@ -7654,13 +7423,16 @@ class WURemovedBOMItemsTab(QWidget):
         _total_elapsed = _time_ui.perf_counter() - _t_start
         _comment_label = ', '.join(required_comment) if isinstance(required_comment, list) else required_comment
 
+        # Apply radio-button-based parent removal immediately after import
+        removed_count = self._remove_parents_by_radio_selection()
+
         QMessageBox.information(
             self,
             'Import Complete',
             f'Imported {len(records)} row(s) from Databricks.\n'
             f'Parts queried (Tool comments = "{_comment_label}"): {len(target_parts)}\n'
             f'WU Level: {max_level} | Plant: {selected_plant}\n'
-            f'Radio filters were applied during query traversal (pre-import).\n'
+            f'Parent rows removed (9024/ESW): {removed_count}\n'
             f'Total time: {_total_elapsed:.1f}s',
         )
 
@@ -7765,7 +7537,7 @@ class WURemovedBOMItemsTab(QWidget):
             QMessageBox.warning(
                 self,
                 'Replacement BOM Required',
-                'Please import Imp REPL Parts BOM before importing WU of Removed BOM Items.'
+                'Please import Imp BOM_REPL Parts before importing WU of Removed BOM Items.'
             )
             return False
 
@@ -7835,7 +7607,7 @@ class WURemovedBOMItemsTab(QWidget):
         pass  # SAP import removed
 
     def _remove_parents_by_radio_selection(self):
-        """Remove parent rows (WU Level != 0) based on radio buttons.
+        """Remove parent rows (WU Level != 0) for 9024 and/or ESW based on radio buttons.
         Called after import AND before orphan analysis.
         Rows where the Replacement column is NOT blank are always kept."""
         wucol = pcol = repl_col = -1
@@ -7855,94 +7627,32 @@ class WURemovedBOMItemsTab(QWidget):
 
         remove_9024 = self.radio_9024_remove.isChecked()
         remove_esw = self.radio_esw_remove.isChecked()
-        remove_above_cfg = self.radio_above_cfg_remove.isChecked()
-        if not remove_9024 and not remove_esw and not remove_above_cfg:
+        if not remove_9024 and not remove_esw:
             return 0
 
-        def _wu_level_of_row(row_idx: int):
-            wu_it = self.table.item(row_idx, wucol)
-            if wu_it is None:
-                return None
-            try:
-                return int(float(wu_it.text().strip()))
-            except (ValueError, TypeError):
-                return None
-
-        def _has_replacement(row_idx: int) -> bool:
-            if repl_col < 0:
-                return False
-            repl_it = self.table.item(row_idx, repl_col)
-            return bool(repl_it is not None and repl_it.text().strip())
-
         rows_to_delete = []
-
-        # 9024/ESW parent filters
         for r in range(self.table.rowCount()):
+            wu_it = self.table.item(r, wucol)
             part_it = self.table.item(r, pcol)
-            if part_it is None:
+            if wu_it is None or part_it is None:
                 continue
-
-            lvl = _wu_level_of_row(r)
-            if lvl is None or lvl == 0:
+            # Skip child rows (WU Level == 0)
+            try:
+                if float(wu_it.text().strip()) == 0.0:
+                    continue
+            except (ValueError, TypeError):
                 continue
-
-            # Keep rows where Replacement is not blank regardless of radio selections.
-            if _has_replacement(r):
-                continue
-
+            # Skip rows where Replacement is not blank — keep them regardless of radio
+            if repl_col >= 0:
+                repl_it = self.table.item(r, repl_col)
+                if repl_it is not None and repl_it.text().strip():
+                    continue
             # Normalize: strip ALL whitespace and uppercase
             pv = ''.join(part_it.text().split()).upper()
             if remove_9024 and pv.startswith('9024'):
                 rows_to_delete.append(r)
             elif remove_esw and pv.startswith('ESW'):
                 rows_to_delete.append(r)
-
-        # SmBOM-above-config filter (same behavior as Where Used import path)
-        if remove_above_cfg:
-            config_prefixes = {
-                '0490', '0491', '0495', '0497', '0430', '0350', '0355', '0351', '0357',
-                '0390', '0395', '0397', '0335', '0391', '0431', '0435', '0437',
-                '0440', '0445', '0455', '0450', '0441', '0447', '0457',
-                '0460', '0465', '0461', '0467', '0410', '0415', '0417',
-                '0411', '0412', '0413', '0414', '0360', '0365', '0361', '0367'
-            }
-            listing_prefixes = {'0243', '0288', '0289', '0290'}
-            prune_anchor_prefixes = config_prefixes | listing_prefixes
-
-            n = self.table.rowCount()
-            r = 0
-            while r < n:
-                lvl = _wu_level_of_row(r)
-                if lvl != 0:
-                    r += 1
-                    continue
-
-                block_start = r
-                block_end = n
-                for i in range(r + 1, n):
-                    lvl_i = _wu_level_of_row(i)
-                    if lvl_i == 0:
-                        block_end = i
-                        break
-
-                for i in range(block_start + 1, block_end):
-                    lvl_i = _wu_level_of_row(i)
-                    if lvl_i is None or lvl_i == 0:
-                        continue
-
-                    part_i_it = self.table.item(i, pcol)
-                    part_i = (part_i_it.text() if part_i_it else '').strip()
-                    if part_i[:4] in prune_anchor_prefixes and not _has_replacement(i):
-                        for j in range(i + 1, block_end):
-                            lvl_j = _wu_level_of_row(j)
-                            if lvl_j is None:
-                                continue
-                            if lvl_j <= lvl_i:
-                                break
-                            if lvl_j != 0 and not _has_replacement(j):
-                                rows_to_delete.append(j)
-
-                r = block_end
 
         for r in sorted(set(rows_to_delete), reverse=True):
             self.table.removeRow(r)
@@ -7974,19 +7684,6 @@ class WURemovedBOMItemsTab(QWidget):
         # Applicable only for With / Without Replacement mode.
         if self.compare_with_replacement:
             self._ensure_obs_proposed_replacement_column()
-
-        # Snapshot existing orphan assignments so we can detect true new findings.
-        _existing_orphan_entries = set()
-        _part_col_pre = self._find_col('Part')
-        _orph_col_pre = self._find_col('Orphans List')
-        if _part_col_pre >= 0 and _orph_col_pre >= 0:
-            for _r in range(self.table.rowCount()):
-                _pit = self.table.item(_r, _part_col_pre)
-                _oit = self.table.item(_r, _orph_col_pre)
-                _p = (_pit.text() if _pit else '').strip().upper()
-                _o = (_oit.text() if _oit else '').strip()
-                if _p and _o and _o.lower().startswith('orphan'):
-                    _existing_orphan_entries.add((_p, _o.lower()))
 
         # Find required columns
         pcol = self._find_col('Part')
@@ -8155,7 +7852,7 @@ class WURemovedBOMItemsTab(QWidget):
                 except (ValueError, TypeError):
                     pass
 
-        if _max_wu_in_data > 1 or self.compare_with_replacement:
+        if _max_wu_in_data > 1:
             # Part-number prefixes whose presence on the immediate parent row
             # exempts the evaluated row from being flagged as Orphan Parent:
             #   Option prefixes, Option Class prefixes, Commodity Codes 0288/0289/0243/0290
@@ -8214,34 +7911,39 @@ class WURemovedBOMItemsTab(QWidget):
                         if _oit and _oit.text().strip():
                             continue
 
-                        # Condition 4: mark as Orphan Parent only when there is no
-                        # immediate next-level child (WU Level = current + 1) under
-                        # this row's branch. Level can vary and this remains dynamic.
-                        _has_next_level_child = False
-                        _child_wu_target = _wu_int + 1
-                        for _j in range(_i + 1, _block_end):
-                            _cj_wu_it = self.table.item(_j, wucol)
-                            if not _cj_wu_it:
+                        # Find the immediate parent row: nearest preceding row in this
+                        # block whose WU Level equals (_wu_int - 1)
+                        _parent_wu_target = _wu_int - 1
+                        _parent_row = -1
+                        for _j in range(_i - 1, _block_start, -1):
+                            _pj_wu_it = self.table.item(_j, wucol)
+                            if not _pj_wu_it:
                                 continue
                             try:
-                                _cj_wu = int(_cj_wu_it.text().strip())
+                                _pj_wu = int(_pj_wu_it.text().strip())
                             except (ValueError, TypeError):
                                 continue
-
-                            # Branch ended for this row.
-                            if _cj_wu <= _wu_int:
+                            if _pj_wu == _parent_wu_target:
+                                _parent_row = _j
+                                break
+                            elif _pj_wu < _parent_wu_target:
+                                # Hierarchy went below the expected level; stop
                                 break
 
-                            # Found at least one direct reporting child.
-                            if _cj_wu == _child_wu_target:
-                                _has_next_level_child = True
-                                break
-
-                        # If part reports to any next-level row, it is NOT orphan parent.
-                        if _has_next_level_child:
+                        # Skip if no clear immediate parent found (conservative)
+                        if _parent_row < 0:
                             continue
 
-                        # No next-level reporting row found in this branch.
+                        # Condition 2: parent must NOT be an Option / Option Class /
+                        # Commodity Code (0288, 0289, 0243, 0290)
+                        _parent_part_it = self.table.item(_parent_row, pcol)
+                        _parent_part = (_parent_part_it.text().lstrip()
+                                        if _parent_part_it else '')
+                        if _parent_part.strip().startswith(_orphan_parent_exempt_prefixes):
+                            # Parent is an exempt type → not an Orphan Parent
+                            continue
+
+                        # All conditions satisfied → mark as Orphan Parent
                         self.table.setItem(_i, ocol, QTableWidgetItem('Orphan Parent'))
 
                     _r = _block_end
@@ -8257,18 +7959,6 @@ class WURemovedBOMItemsTab(QWidget):
                     it = self.table.item(r, c)
                     if it:
                         it.setBackground(QColor('#87CEEB'))
-
-        # Notify user when no newly identified orphan entries were added by this run.
-        _new_orphan_entries = set()
-        for _r in range(self.table.rowCount()):
-            _pit = self.table.item(_r, pcol)
-            _oit = self.table.item(_r, ocol)
-            _p = (_pit.text() if _pit else '').strip().upper()
-            _o = (_oit.text() if _oit else '').strip()
-            if _p and _o and _o.lower().startswith('orphan'):
-                _new_orphan_entries.add((_p, _o.lower()))
-        if not (_new_orphan_entries - _existing_orphan_entries):
-            QMessageBox.information(self, 'Orphan Analysis', 'Orphan Analysis completed no new Orphans Found.')
 
 
     def remove_by_prefix(self, prefix):
@@ -8294,7 +7984,7 @@ class  OBSAllPartsWithoutReplacementTab(QWidget):
         radio_row = QHBoxLayout()
         radio_row.setContentsMargins(0, 0, 0, 0)
         radio_row.setSpacing(16)
-        self.rb_without = QRadioButton("Without Replacement*")
+        self.rb_without = QRadioButton("Without Replacement")
         self.rb_with = QRadioButton("With / Without Replacement")
         self.rb_without.setChecked(True)
         radio_group = QButtonGroup(self)
@@ -8436,7 +8126,6 @@ class LimitedTextEdit(QTextEdit):
 
 class ECCreationInputsFormTab(QWidget):
     ec_category_selected = pyqtSignal(str)
-    reset_form_requested = pyqtSignal()
 
     def __init__(self):
         super().__init__()
@@ -8449,25 +8138,7 @@ class ECCreationInputsFormTab(QWidget):
         outer = QVBoxLayout(container)
 
         # ---- Section A ----
-        section_a_title_row = QHBoxLayout()
-        section_a_title_row.addWidget(header("Section A: EC Category Form"))
-        section_a_title_row.addStretch(1)
-
-        self.btn_reset_ec_form = QPushButton("Reset All")
-        self.btn_reset_ec_form.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_reset_ec_form.setStyleSheet(
-            "QPushButton {"
-            "  color:#FFFFFF; padding:6px 14px; border-radius:6px; border:1px solid #0D5EA6;"
-            "  background-color:qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #2994FF, stop:1 #0A67C2);"
-            "}"
-            "QPushButton:hover {"
-            "  background-color:qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #2FA0FF, stop:1 #0D6ED0);"
-            "}"
-        )
-        self.btn_reset_ec_form.clicked.connect(self._request_reset_ec_form)
-        section_a_title_row.addWidget(self.btn_reset_ec_form)
-        outer.addLayout(section_a_title_row)
-
+        outer.addWidget(header("Section A: EC Category Form"))
         secA = QFrame(); a = QVBoxLayout(secA)
 
         scope_row = QHBoxLayout(); scope_grp = QButtonGroup(self)
@@ -8812,8 +8483,7 @@ class ECCreationInputsFormTab(QWidget):
         """)
 
         
-        # Keep this margin small so Section B stays inside smaller displays.
-        section_b_right.setContentsMargins(0, 0, 24, 0)
+        section_b_right.setContentsMargins(0, 0, 300, 0)   # 👈 right margin pushes box left
         section_b_right.addWidget(scope_lbl)
         section_b_right.addWidget(self.scope_parts_txt)
         section_b_right.addSpacing(10)
@@ -10921,56 +10591,6 @@ class ECCreationInputsFormTab(QWidget):
             f"<b>EC Category {c}:</b><br>{desc}<br><br>{just}"
         )
 
-    def _request_reset_ec_form(self):
-        self.reset_form_requested.emit()
-
-    def reset(self):
-        self._solution_regen_requested = False
-        self.email_file_path = None
-        self.selected_tab_payload = {}
-        self._current_rc_scenario = ""
-        self._current_rc_evidence = []
-        self._current_rc_reason_lines = []
-
-        # Clear all text inputs and combo selections back to default.
-        for line_edit in self.findChildren(QLineEdit):
-            line_edit.clear()
-        for text_edit in self.findChildren(QTextEdit):
-            text_edit.clear()
-        for combo in self.findChildren(QComboBox):
-            if combo.count() > 0:
-                combo.setCurrentIndex(0)
-        for check in self.findChildren(QCheckBox):
-            check.setChecked(False)
-
-        # Fully clear radio selections by disabling exclusivity temporarily.
-        groups = self.findChildren(QButtonGroup)
-        for grp in groups:
-            grp.setExclusive(False)
-        for rb in self.findChildren(QRadioButton):
-            rb.setChecked(False)
-            rb.setEnabled(True)
-        for grp in groups:
-            grp.setExclusive(True)
-
-        for txt in self.ref_boxes.values():
-            txt.clear()
-            txt.setVisible(False)
-        for lbl in self.ref_labels.values():
-            lbl.setEnabled(True)
-
-        if hasattr(self, "_browse_email_btn") and self._browse_email_btn is not None:
-            self._browse_email_btn.setText("Browse Attachment")
-            self._browse_email_btn.setVisible(False)
-
-        self.ai_ec_justification_btn.setToolTip("Run Problem Summary to see EC Category justification")
-        self.ai_justification_btn.setToolTip("Click to see Scenario and Examples for the proposed Reason Code")
-
-        self.clear_flow()
-        self.ec_divider.setVisible(False)
-        self.secB_header.setVisible(False)
-        self.secB.setVisible(False)
-
 
 class ECTabVisibilityPolicy:
     BASE_VISIBLE_TABS = {"READ ME", "EC Creation Form"}
@@ -11111,18 +10731,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(APP_TITLE)
-        screen = QGuiApplication.primaryScreen()
-        if screen is not None:
-            avail = screen.availableGeometry()
-            w = max(640, min(1280, avail.width() - 32))
-            h = max(520, min(860, avail.height() - 32))
-            self.resize(w, h)
-            self.move(
-                avail.x() + max(0, (avail.width() - w) // 2),
-                avail.y() + max(0, (avail.height() - h) // 2),
-            )
-        else:
-            self.resize(1280, 860)
+        self.resize(1280, 860)
         self.setStyleSheet("""
             QScrollBar:vertical {
                 background: #EAF1F8;
@@ -11195,17 +10804,14 @@ class MainWindow(QMainWindow):
             )
         )
 
-        if WatchListTab is not None:
-            self.watch_list_tab = WatchListTab(self)
-        else:
-            self.watch_list_tab = QWidget()
-            watch_layout = QVBoxLayout(self.watch_list_tab)
-            watch_title = QLabel("Watch_List")
-            watch_title.setFont(QFont("Segoe UI", 14, QFont.Weight.DemiBold))
-            watch_layout.addWidget(watch_title)
-            watch_notes = QTextEdit()
-            watch_notes.setPlaceholderText('Watch_List module is not available.')
-            watch_layout.addWidget(watch_notes)
+        self.watch_list_tab = QWidget()
+        watch_layout = QVBoxLayout(self.watch_list_tab)
+        watch_title = QLabel("Watch_List")
+        watch_title.setFont(QFont("Segoe UI", 14, QFont.Weight.DemiBold))
+        watch_layout.addWidget(watch_title)
+        watch_notes = QTextEdit()
+        watch_notes.setPlaceholderText('Track watch-list parts, risks, and follow-up actions here.')
+        watch_layout.addWidget(watch_notes)
 
         self.tabs.addTab(self.readme_tab, "READ ME")
         self.tabs.addTab(self.ec_form_tab, "EC Creation Form"); self.tabs.setDocumentMode(True); self.tabs.setMovable(True)
@@ -11362,7 +10968,6 @@ class MainWindow(QMainWindow):
                 self._dirty_watchers.append(TabDirtyWatcher(tab_name, tab_widget, self._dirty_state))
 
         self.ec_form_tab.ec_category_selected.connect(self._on_ec_category_selected)
-        self.ec_form_tab.reset_form_requested.connect(self._on_reset_ec_creation_form_requested)
         self._apply_visibility_for_category(None)
 
     def _set_tab_visible(self, tab_name: str, visible: bool):
@@ -11516,31 +11121,6 @@ class MainWindow(QMainWindow):
         else:
             QMessageBox.information(self, "No Save Found", "No saved data file found yet. Click Save to create one.")
 
-    def _on_reset_ec_creation_form_requested(self):
-        ans = QMessageBox.question(
-            self,
-            "Reset All",
-            "This will reset EC Creation Form and hide all tabs except READ ME and EC Creation Form. Do you want to continue?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
-        if ans != QMessageBox.StandardButton.Yes:
-            return
-
-        try:
-            self.ec_form_tab.reset()
-            self._current_ec_category = None
-            self._apply_visibility_for_category(None)
-            self.tabs.setCurrentWidget(self.ec_form_tab)
-            self._dirty_state.clear_all()
-            QMessageBox.information(
-                self,
-                "Reset Complete",
-                "EC Creation Form has been reset. Only READ ME and EC Creation Form are visible now.",
-            )
-        except Exception as e:
-            QMessageBox.warning(self, "Reset Failed", str(e))
-
     def reset_app(self):
         ans=QMessageBox.question(self, "Reset App", "This will clear all fields, reset tables and remove any saved data. Do you want to continue?",
                                  QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No)
@@ -11577,7 +11157,7 @@ class OrphanAnalysisTab(QWidget):
         title.setFont(QFont("Segoe UI", 14, QFont.Weight.DemiBold))
 
         from PyQt6.QtWidgets import QRadioButton, QButtonGroup
-        self.rb_without = QRadioButton("Without Replacement*")
+        self.rb_without = QRadioButton("Without Replacement")
         self.rb_with = QRadioButton("With / Without Replacement")
         self.rb_without.setChecked(True)
 
@@ -11590,25 +11170,7 @@ class OrphanAnalysisTab(QWidget):
         h.addWidget(self.rb_without)
         h.addWidget(self.rb_with)
         h.addStretch(1)
-        self.btn_export_excel = QPushButton("Export Excel")
-        self.btn_export_excel.setToolTip("Export OBS Parts and active Orphan Analysis tabs to Excel")
-        h.addWidget(self.btn_export_excel)
         outer.addWidget(header)
-
-        self.lbl_without_replacement_note = QLabel(
-            "* This Orphan Analysis evaluates multiple BOM levels in a single step, "
-            "assuming all identified orphan components are obsolete with no replacements."
-        )
-        self.lbl_without_replacement_note.setWordWrap(True)
-        self.lbl_without_replacement_note.setStyleSheet("color:#7A1C21; font-size:11px;")
-        outer.addWidget(self.lbl_without_replacement_note)
-
-        self.lbl_with_replacement_note = QLabel(
-            "Export WU to multiple level only if Orphan Parents to be identified."
-        )
-        self.lbl_with_replacement_note.setWordWrap(True)
-        self.lbl_with_replacement_note.setStyleSheet("color:#C1272D; font-size:11px;")
-        outer.addWidget(self.lbl_with_replacement_note)
 
 
         # --- Sub-tabs for each mode ---
@@ -11627,8 +11189,8 @@ class OrphanAnalysisTab(QWidget):
         self.tab_with_wu_removed.enable_with_replacement_compare(self.tab_with_repl)
         self.tab_with_wu_removed.configure_orphan_append_behavior(prompt_replacement_updates=True)
 
-        # Customize only the With/Without Replacement -> replacement BOM button behavior.
-        self.tab_with_repl.btn_import.setText("Import BOM of REPL Parts")
+        # Customize only the With/Without Replacement -> Imp BOM_REPL Parts button behavior.
+        self.tab_with_repl.btn_import.setText("Imp BOM_REPL Parts")
         try:
             self.tab_with_repl.btn_import.clicked.disconnect()
         except Exception:
@@ -11642,18 +11204,14 @@ class OrphanAnalysisTab(QWidget):
                 self.tabs.addTab(self.tab_without_wu_removed, "WU of Removed BOM Items")
             elif mode == 'with':
                 self.tabs.addTab(self.tab_with_obs, "Imp BOM_OBS Parts")
-                self.tabs.addTab(self.tab_with_repl, "Imp REPL Parts BOM")
+                self.tabs.addTab(self.tab_with_repl, "Imp BOM_REPL Parts")
                 self.tabs.addTab(self.tab_with_wu_removed, "WU of Removed BOM Items")
         self._set_subtabs = set_subtabs
 
         outer.addWidget(self.tabs)
         self.rb_without.toggled.connect(lambda checked: checked and self._set_subtabs('without'))
         self.rb_with.toggled.connect(lambda checked: checked and self._set_subtabs('with'))
-        self.rb_without.toggled.connect(lambda _checked: self._update_without_replacement_note())
-        self.rb_with.toggled.connect(lambda _checked: self._update_without_replacement_note())
-        self.btn_export_excel.clicked.connect(self.export_orphan_analysis_excel)
         self._set_subtabs('without')
-        self._update_without_replacement_note()
 
         obs_table = getattr(self.obs_provider, 'table', None)
         if obs_table is not None:
@@ -11671,10 +11229,6 @@ class OrphanAnalysisTab(QWidget):
 
     def _on_obs_table_structure_changed(self, *_args):
         self._auto_switch_mode_from_obs()
-
-    def _update_without_replacement_note(self):
-        self.lbl_without_replacement_note.setVisible(self.rb_without.isChecked())
-        self.lbl_with_replacement_note.setVisible(self.rb_with.isChecked())
 
     def _has_any_valid_replacement(self) -> bool:
         t = getattr(self.obs_provider, 'table', None)
@@ -11702,296 +11256,6 @@ class OrphanAnalysisTab(QWidget):
             self.rb_without.setEnabled(True)
             self.rb_with.setEnabled(False)
             self._set_subtabs('without')
-
-    def _table_to_export_dataframe(self, table: QTableWidget) -> pd.DataFrame:
-        if table is None or table.columnCount() == 0:
-            return pd.DataFrame()
-
-        headers = []
-        for c in range(table.columnCount()):
-            h = table.horizontalHeaderItem(c)
-            headers.append(h.text().strip() if h and h.text() else f'Column {c + 1}')
-
-        rows = []
-        for r in range(table.rowCount()):
-            row_data = {}
-            has_value = False
-            for c, header in enumerate(headers):
-                value = ''
-                cell_widget = table.cellWidget(r, c)
-
-                if isinstance(cell_widget, QComboBox):
-                    value = cell_widget.currentText().strip()
-                elif isinstance(cell_widget, QTextEdit):
-                    value = cell_widget.toPlainText().strip()
-                elif isinstance(cell_widget, QCheckBox):
-                    value = 'Yes' if cell_widget.isChecked() else 'No'
-                elif isinstance(cell_widget, QWidget):
-                    chk = cell_widget.findChild(QCheckBox)
-                    if chk is not None:
-                        value = 'Yes' if chk.isChecked() else 'No'
-                    else:
-                        item = table.item(r, c)
-                        value = item.text() if item and item.text() else ''  # Preserve indents
-                else:
-                    item = table.item(r, c)
-                    value = item.text() if item and item.text() else ''  # Preserve indents
-
-                if value:
-                    has_value = True
-                row_data[header] = value
-
-            if has_value:
-                rows.append(row_data)
-
-        export_headers = [h for h in headers if h.strip().lower() != 'select']
-        df = pd.DataFrame(rows, columns=headers)
-        if not export_headers:
-            return pd.DataFrame()
-        return df.loc[:, export_headers]
-
-    @staticmethod
-    def _safe_excel_sheet_name(name: str) -> str:
-        cleaned = re.sub(r'[\\/*?:\[\]]', '_', (name or '').strip())
-        return (cleaned or 'Sheet')[:31]
-
-    def _mode_export_sheets(self):
-        if self.rb_with.isChecked():
-            return [
-                ('Imp BOM_OBS Parts', self.tab_with_obs.table),
-                ('Imp REPL Parts BOM', self.tab_with_repl.table),
-                ('WU of Removed BOM Items', self.tab_with_wu_removed.table),
-            ]
-        return [
-            ('Imp BOM_OBS Parts', self.tab_without_imp_bom.table),
-            ('WU of Removed BOM Items', self.tab_without_wu_removed.table),
-        ]
-
-    def _build_orphan_overview_chains(self, wu_df: pd.DataFrame) -> dict[int, list[list[tuple[str, str]]]]:
-        if wu_df is None or wu_df.empty:
-            return {}
-
-        cols = {str(c).strip().lower(): c for c in wu_df.columns}
-        part_col = cols.get('part')
-        status_col = cols.get('orphans list')
-        level_col = cols.get('wu level')
-        if part_col is None or status_col is None or level_col is None:
-            return {}
-
-        rows = []
-        for _, row in wu_df.iterrows():
-            part = str(row.get(part_col, '') or '').strip()
-            status = str(row.get(status_col, '') or '').strip()
-            level_txt = str(row.get(level_col, '') or '').strip()
-            if not part:
-                continue
-            try:
-                level = int(float(level_txt))
-            except (ValueError, TypeError):
-                continue
-            rows.append({'part': part, 'status': status, 'level': level})
-
-        if not rows:
-            return {}
-
-        parent_idx = {}
-        stack = []
-        for idx, rec in enumerate(rows):
-            lvl = rec['level']
-            while stack and rows[stack[-1]]['level'] >= lvl:
-                stack.pop()
-            parent_idx[idx] = stack[-1] if stack else None
-            stack.append(idx)
-
-        orphan_re = re.compile(r'^orphan\d+$', re.IGNORECASE)
-        obsolete_re = re.compile(r'^obsolete$', re.IGNORECASE)
-
-        def _orphan_num(status_text: str):
-            m = re.match(r'^orphan\s*(\d+)$', (status_text or '').strip(), re.IGNORECASE)
-            if not m:
-                return None
-            try:
-                return int(m.group(1))
-            except (ValueError, TypeError):
-                return None
-
-        chains_by_level: dict[int, list[list[tuple[str, str]]]] = {}
-        seen_by_level: dict[int, set[tuple[tuple[str, str], ...]]] = {}
-        for idx, rec in enumerate(rows):
-            status = rec['status'].strip()
-            if not orphan_re.match(status):
-                continue
-            orphan_level = _orphan_num(status)
-            if orphan_level is None:
-                continue
-
-            chain_idx = []
-            visited = set()
-            cur = idx
-            while cur is not None and cur not in visited:
-                visited.add(cur)
-                chain_idx.append(cur)
-                cur_status = rows[cur]['status'].strip()
-                if obsolete_re.match(cur_status):
-                    break
-                cur = parent_idx.get(cur)
-
-            chain_items = [(rows[i]['part'], rows[i]['status'].strip()) for i in chain_idx]
-            if not chain_items:
-                continue
-
-            key = tuple(chain_items)
-            seen_for_level = seen_by_level.setdefault(orphan_level, set())
-            if key in seen_for_level:
-                continue
-            seen_for_level.add(key)
-            chains_by_level.setdefault(orphan_level, []).append(chain_items)
-
-        return chains_by_level
-
-    def _write_orphans_overview_sheet(self, wb, chains_by_level: dict[int, list[list[tuple[str, str]]]]):
-        if 'Orphans Overview' in wb.sheetnames:
-            del wb['Orphans Overview']
-        ws = wb.create_sheet('Orphans Overview')
-        ws.sheet_view.showGridLines = False
-
-        section_levels = sorted(chains_by_level.keys())
-        if not section_levels:
-            ws.cell(row=1, column=1, value='No orphan chains found in WU of Removed BOM Items.')
-            ws.column_dimensions['A'].width = 70
-            return
-
-        section_gap = 2
-        section_width = 1
-        first_data_row = 3
-        white_fill = PatternFill(start_color='FFFFFF', end_color='FFFFFF', fill_type='solid')
-        for sec_idx, orphan_level in enumerate(section_levels):
-            col = 1 + sec_idx * (section_width + section_gap)
-            ws.cell(row=1, column=col, value=f'ORPHAN {orphan_level} CHAINS')
-
-            row_ptr = first_data_row
-            for chain in chains_by_level.get(orphan_level, []):
-                for depth, (part, status) in enumerate(chain):
-                    indent = ' ' * (depth * 3)
-                    line = f"{indent}{part}  ({status})"
-                    cell = ws.cell(row=row_ptr, column=col, value=line)
-                    cell.fill = white_fill
-                    row_ptr += 1
-                row_ptr += 1
-
-            max_len = 0
-            for r in range(1, max(ws.max_row, row_ptr) + 1):
-                v = ws.cell(row=r, column=col).value
-                txt = '' if v is None else str(v)
-                if len(txt) > max_len:
-                    max_len = len(txt)
-            ws.column_dimensions[get_column_letter(col)].width = min(max(max_len + 2, 28), 120)
-
-    def export_orphan_analysis_excel(self):
-        try:
-            save_path, _ = QFileDialog.getSaveFileName(
-                self,
-                'Export Orphan Analysis',
-                'orphan_analysis_export.xlsx',
-                'Excel Files (*.xlsx)',
-            )
-            if not save_path:
-                return
-
-            if not save_path.lower().endswith('.xlsx'):
-                save_path += '.xlsx'
-
-            sheets_to_export = []
-
-            obs_table = getattr(self.obs_provider, 'table', None)
-            if obs_table is not None:
-                sheets_to_export.append(('OBS Parts', obs_table))
-
-            sheets_to_export.extend(self._mode_export_sheets())
-
-            written = 0
-            with pd.ExcelWriter(save_path, engine='openpyxl') as writer:
-                for sheet_name, table in sheets_to_export:
-                    if table is None:
-                        continue
-                    df = self._table_to_export_dataframe(table)
-                    df.to_excel(
-                        writer,
-                        index=False,
-                        sheet_name=self._safe_excel_sheet_name(sheet_name),
-                    )
-                    written += 1
-
-            # Post-process workbook: add Orphans Overview, sky-blue level-0 rows, autofit.
-            orphan_chains_by_level: dict[int, list[list[tuple[str, str]]]] = {}
-            try:
-                wu_df = pd.read_excel(save_path, sheet_name='WU of Removed BOM Items', dtype=str)
-                orphan_chains_by_level = self._build_orphan_overview_chains(wu_df)
-            except Exception:
-                orphan_chains_by_level = {}
-
-            wb = load_workbook(save_path)
-            sky_blue_fill = PatternFill(start_color='87CEEB', end_color='87CEEB', fill_type='solid')
-
-            for sheet_name, table in sheets_to_export:
-                if table is None:
-                    continue
-                safe_name = self._safe_excel_sheet_name(sheet_name)
-                if safe_name not in wb.sheetnames:
-                    continue
-                sheet = wb[safe_name]
-
-                # Find hierarchy level column (BOM Level preferred, WU Level fallback).
-                level_col = None
-                for col_idx, cell in enumerate(sheet[1], 1):
-                    header = str(cell.value).strip().lower() if cell.value is not None else ''
-                    if header == 'bom level':
-                        level_col = col_idx
-                        break
-                if level_col is None:
-                    for col_idx, cell in enumerate(sheet[1], 1):
-                        header = str(cell.value).strip().lower() if cell.value is not None else ''
-                        if header == 'wu level':
-                            level_col = col_idx
-                            break
-
-                # Apply sky blue to rows where level == 0.
-                if level_col is not None:
-                    for row_idx in range(2, sheet.max_row + 1):
-                        level_cell = sheet.cell(row=row_idx, column=level_col)
-                        if level_cell.value is None:
-                            continue
-                        try:
-                            if float(str(level_cell.value).strip()) == 0.0:
-                                for col_idx in range(1, sheet.max_column + 1):
-                                    sheet.cell(row=row_idx, column=col_idx).fill = sky_blue_fill
-                        except (ValueError, TypeError):
-                            pass
-
-            # Add Orphans Overview as the last sheet.
-            self._write_orphans_overview_sheet(wb, orphan_chains_by_level)
-
-            # Auto-fit all columns in all sheets.
-            for sheet in wb.worksheets:
-                for col_idx in range(1, sheet.max_column + 1):
-                    max_len = 0
-                    for row_idx in range(1, sheet.max_row + 1):
-                        value = sheet.cell(row=row_idx, column=col_idx).value
-                        txt = '' if value is None else str(value)
-                        if len(txt) > max_len:
-                            max_len = len(txt)
-                    sheet.column_dimensions[get_column_letter(col_idx)].width = min(max(max_len + 2, 10), 120)
-
-            wb.save(save_path)
-
-            mode_label = 'With / Without Replacement' if self.rb_with.isChecked() else 'Without Replacement'
-            QMessageBox.information(
-                self,
-                'Export Complete',
-                f'Exported {written} sheet(s) to:\n{save_path}\nMode: {mode_label}'
-            )
-        except Exception as e:
-            QMessageBox.warning(self, 'Export Error', str(e))
 
 
 
