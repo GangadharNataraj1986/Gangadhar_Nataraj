@@ -1,4 +1,4 @@
-﻿import threading
+import threading
 import pyodbc
 def fetch_distinct_kit_codes(plant='4070'):
     """Fetch distinct kit codes from Databricks BOM table."""
@@ -56,6 +56,15 @@ except ImportError:
     WatchListTab = None
 
 try:
+    from PSS_Change_Summary import (
+        export_change_summary,
+        generate_change_summary_sentences,
+    )
+except ImportError:
+    export_change_summary = None
+    generate_change_summary_sentences = None
+
+try:
     from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
     from matplotlib.figure import Figure
     _HAS_MATPLOTLIB = True
@@ -68,7 +77,7 @@ import pandas as pd
 from openpyxl import load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
-from PyQt6.QtCore import Qt, QRect, QObject, QEvent, pyqtSignal
+from PyQt6.QtCore import Qt, QRect, QObject, QEvent, pyqtSignal, QTimer
 from PyQt6.QtGui import QAction, QBrush, QColor, QFont, QFontMetrics, QGuiApplication, QPalette, QPen, QTextCursor
 from PyQt6.QtWidgets import (
     QApplication,
@@ -253,12 +262,11 @@ def _format_pss_for_html_display(text: str) -> str:
         else:
             # Always bold key PSS headers even when they appear inline.
             escaped = fixed_headers_pattern.sub(r"<b>\1</b>", escaped)
-            # Bold **From:** and **To:** markdown markers output by LLM
-            escaped = re.sub(r"\*\*(From:)\*\*", r"<b>\1</b>", escaped)
-            escaped = re.sub(r"\*\*(To:)\*\*", r"<b>\1</b>", escaped)
-            # Also bold plain From: / To: as fallback
-            escaped = re.sub(r"(?<![*>])(From:)(?![*<])", r"<b>\1</b>", escaped)
-            escaped = re.sub(r"(?<![*>])(To:)(?![*<])", r"<b>\1</b>", escaped)
+            # Bold markdown and plain From/To tokens (case-insensitive, tolerant of spacing).
+            escaped = re.sub(r"\*\*(from\s*:)\*\*", r"<b>\1</b>", escaped, flags=re.IGNORECASE)
+            escaped = re.sub(r"\*\*(to\s*:)\*\*", r"<b>\1</b>", escaped, flags=re.IGNORECASE)
+            escaped = re.sub(r"(?<![*>])(from\s*:)(?![*<])", r"<b>\1</b>", escaped, flags=re.IGNORECASE)
+            escaped = re.sub(r"(?<![*>])(to\s*:)(?![*<])", r"<b>\1</b>", escaped, flags=re.IGNORECASE)
             html_parts.append(escaped)
 
     return "<br>".join(html_parts)
@@ -457,7 +465,7 @@ class OBSTable(QTableWidget):
             except Exception: pass
 
     def _make_change_combo(self)->QComboBox:
-        combo=QComboBox(); combo.addItems(["Obsolete","Inactivate"]); combo.setCurrentText("Obsolete"); return combo
+        combo=QComboBox(); combo.addItems(["", "Obsolete","Inactivate"]); combo.setCurrentText("Obsolete"); return combo
 
     def _init_rows(self,start,end):
         for r in range(start,end):
@@ -564,6 +572,267 @@ class OBSPartsTab(QWidget):
                 if cb:
                     cb.setChecked(True)
 
+    def _selected_obs_rows_and_parts(self):
+        rows_to_delete = []
+        deleted_parts = []
+        for r in range(self.table.rowCount()):
+            w = self.table.cellWidget(r, 0)
+            if not w:
+                continue
+            cb = w.findChild(QCheckBox)
+            if not (cb and cb.isChecked()):
+                continue
+            rows_to_delete.append(r)
+            pit = self.table.item(r, 1)
+            part = (pit.text() if pit else '').strip().upper()
+            if part:
+                deleted_parts.append(part)
+        return rows_to_delete, deleted_parts
+
+    def _has_orphan_hierarchy_tab(self):
+        if self.orphan_hierarchy_tab is None:
+            return False
+        return self.subtabs.indexOf(self.orphan_hierarchy_tab) >= 0
+
+    def _nonempty_obs_rows(self):
+        rows = []
+        for r in range(self.table.rowCount()):
+            pit = self.table.item(r, 1)
+            part = (pit.text() if pit else '').strip()
+            if part:
+                rows.append(r)
+        return rows
+
+    def _is_full_obs_deletion(self, rows_to_delete):
+        data_rows = self._nonempty_obs_rows()
+        if not data_rows:
+            return False
+        selected = set(rows_to_delete or [])
+        return all(r in selected for r in data_rows)
+
+    def _reset_orphan_hierarchy_state(self):
+        if self.orphan_hierarchy_table is not None:
+            self.orphan_hierarchy_table.setRowCount(0)
+        if self.orphan_hierarchy_tab is not None:
+            idx = self.subtabs.indexOf(self.orphan_hierarchy_tab)
+            if idx >= 0:
+                self.subtabs.removeTab(idx)
+        self.orphan_hierarchy_tab = None
+        self.orphan_hierarchy_table = None
+
+    def _hier_parse_level(self, table: QTableWidget, row_idx: int):
+        it = table.item(row_idx, 0)
+        txt = (it.text() if it else '').strip()
+        if not txt:
+            return None
+        try:
+            return int(txt)
+        except Exception:
+            return None
+
+    def _hier_part_key(self, table: QTableWidget, row_idx: int) -> str:
+        it = table.item(row_idx, 1)
+        return (it.text() if it else '').strip().upper()
+
+    def _hier_subtree_end(self, table: QTableWidget, anchor_row: int) -> int:
+        base_lvl = self._hier_parse_level(table, anchor_row)
+        if base_lvl is None:
+            return anchor_row
+        end = anchor_row
+        for rr in range(anchor_row + 1, table.rowCount()):
+            lvl = self._hier_parse_level(table, rr)
+            if lvl is None:
+                break
+            if lvl <= base_lvl:
+                break
+            end = rr
+        return end
+
+    def _remove_parts_from_orphan_hierarchy(self, deleted_parts):
+        ht = self.orphan_hierarchy_table
+        if ht is None or not deleted_parts:
+            return set()
+
+        targets = {p.strip().upper() for p in deleted_parts if p and p.strip()}
+        if not targets:
+            return set()
+
+        dependent_parts = set()
+        removed_any = True
+        while removed_any:
+            removed_any = False
+            rr = ht.rowCount() - 1
+            while rr >= 0:
+                lvl = self._hier_parse_level(ht, rr)
+                if lvl is None:
+                    rr -= 1
+                    continue
+
+                root_part = self._hier_part_key(ht, rr)
+                if root_part not in targets:
+                    rr -= 1
+                    continue
+
+                end = self._hier_subtree_end(ht, rr)
+                base_lvl = lvl
+                for i in range(rr, end + 1):
+                    ilvl = self._hier_parse_level(ht, i)
+                    if ilvl is None:
+                        continue
+                    pkey = self._hier_part_key(ht, i)
+                    if not pkey:
+                        continue
+                    if ilvl > base_lvl:
+                        dependent_parts.add(pkey)
+                    # Ensure duplicates are removed across all blocks in subsequent scans.
+                    targets.add(pkey)
+
+                for _ in range(end - rr + 1):
+                    ht.removeRow(rr)
+
+                removed_any = True
+                rr -= 1
+
+        return dependent_parts
+
+    def _remove_orphan_children_from_final_obs(self, candidate_parts):
+        if not candidate_parts:
+            return
+        part_set = {p.strip().upper() for p in candidate_parts if p and p.strip()}
+        if not part_set:
+            return
+
+        identified_col = -1
+        for c in range(self.table.columnCount()):
+            h = self.table.horizontalHeaderItem(c)
+            if h and h.text().strip().lower() == 'identified orphans':
+                identified_col = c
+                break
+        if identified_col < 0:
+            return
+
+        rows_to_delete = []
+        for r in range(self.table.rowCount()):
+            pit = self.table.item(r, 1)
+            part = (pit.text() if pit else '').strip().upper()
+            if part not in part_set:
+                continue
+            iit = self.table.item(r, identified_col)
+            identified = (iit.text() if iit else '').strip().lower()
+            if re.match(r'^orphan\s*\d+$', identified):
+                rows_to_delete.append(r)
+
+        for r in reversed(rows_to_delete):
+            self.table.removeRow(r)
+
+    def _cleanup_invalid_hierarchy_blocks(self):
+        ht = self.orphan_hierarchy_table
+        if ht is None:
+            return
+
+        blocks = []
+        start = -1
+        for rr in range(ht.rowCount()):
+            lvl = self._hier_parse_level(ht, rr)
+            if lvl is None:
+                part = self._hier_part_key(ht, rr).lower()
+                if part.startswith('block '):
+                    if start >= 0:
+                        blocks.append((start, rr - 1))
+                    start = rr
+        if start >= 0:
+            blocks.append((start, ht.rowCount() - 1))
+
+        to_remove = []
+        for bstart, bend in blocks:
+            has_orphan_child = False
+            has_data_row = False
+            for rr in range(bstart + 1, bend + 1):
+                lvl = self._hier_parse_level(ht, rr)
+                if lvl is None:
+                    continue
+                has_data_row = True
+                iit = ht.item(rr, 2)
+                identified = (iit.text() if iit else '').strip().lower()
+                if re.match(r'^orphan\s*\d+$', identified):
+                    has_orphan_child = True
+                    break
+            if (not has_data_row) or (not has_orphan_child):
+                to_remove.append((bstart, bend))
+
+        for bstart, bend in reversed(to_remove):
+            for _ in range(bend - bstart + 1):
+                ht.removeRow(bstart)
+
+        # Hide tab if hierarchy has no data rows left.
+        has_data = False
+        for rr in range(ht.rowCount()):
+            if self._hier_parse_level(ht, rr) is not None:
+                has_data = True
+                break
+        if not has_data and self.orphan_hierarchy_tab is not None:
+            idx = self.subtabs.indexOf(self.orphan_hierarchy_tab)
+            if idx >= 0:
+                self.subtabs.removeTab(idx)
+
+    def delete_selected_rows_with_sync(self):
+        rows_to_delete, deleted_parts = self._selected_obs_rows_and_parts()
+        if not rows_to_delete:
+            return
+
+        has_hierarchy_tab = self._has_orphan_hierarchy_tab()
+        full_delete = has_hierarchy_tab and self._is_full_obs_deletion(rows_to_delete)
+
+        if not has_hierarchy_tab:
+            for r in reversed(rows_to_delete):
+                self.table.removeRow(r)
+            if self.table.rowCount() == 0:
+                self.table.setRowCount(10)
+                self.table._init_rows(0, 10)
+            return
+
+        if full_delete:
+            msg = (
+                'Warning: You are deleting all entries from Final OBS List.\n\n'
+                'This will completely clear the Orphan Hierarchy.\n\n'
+                '- Select ‘Yes’ to proceed.'
+            )
+        else:
+            msg = (
+                'Warning: Deleting this part will remove all its dependent child items.\n\n'
+                'This action will also:\n'
+                '- Delete associated Orphan child parts from Final OBS Parts List\n'
+                '- Update all related blocks in Orphan Hierarchy\n\n'
+                '- Select ‘Yes’ to proceed.'
+            )
+
+        reply = QMessageBox.question(
+            self,
+            'Delete Confirmation',
+            msg,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        for r in reversed(rows_to_delete):
+            self.table.removeRow(r)
+
+        if full_delete:
+            if self.table.rowCount() == 0:
+                self.table.setRowCount(10)
+                self.table._init_rows(0, 10)
+            self._reset_orphan_hierarchy_state()
+            return
+
+        dependent_parts = self._remove_parts_from_orphan_hierarchy(deleted_parts)
+        self._remove_orphan_children_from_final_obs(dependent_parts)
+        self._cleanup_invalid_hierarchy_blocks()
+
+        if not self._nonempty_obs_rows():
+            self._reset_orphan_hierarchy_state()
+
     def __init__(self):
         super().__init__()
         outer=QVBoxLayout(self)
@@ -609,8 +878,33 @@ class OBSPartsTab(QWidget):
         legend.setStyleSheet("padding:4px;")
         outer.addWidget(legend)
 
+        self.proposed_replacement_note = QLabel(
+            "Note: The replacement is determined by comparing the BOM items of the "
+            "<b>OBS</b> and <b>Replacement</b> parent parts, and replacements are proposed "
+            "by matching item descriptions of BOM Items."
+        )
+        self.proposed_replacement_note.setWordWrap(True)
+        self.proposed_replacement_note.setVisible(False)
+        self.proposed_replacement_note.setStyleSheet(
+            "color:#C1272D; padding:2px 0 6px 0;"
+        )
+        outer.addWidget(self.proposed_replacement_note)
 
-        self.table=OBSTable(self, initial_rows=1); outer.addWidget(self.table)
+
+        self.subtabs = QTabWidget(self)
+        self.final_obs_tab = QWidget(self)
+        final_layout = QVBoxLayout(self.final_obs_tab)
+        final_layout.setContentsMargins(0, 0, 0, 0)
+        final_layout.setSpacing(0)
+
+        self.table=OBSTable(self, initial_rows=1)
+        final_layout.addWidget(self.table)
+        self.subtabs.addTab(self.final_obs_tab, "Final OBS List")
+
+        self.orphan_hierarchy_tab = None
+        self.orphan_hierarchy_table = None
+
+        outer.addWidget(self.subtabs)
 
         self.setStyleSheet("""
             QTableWidget { background:#FFFFFF; alternate-background-color:#FFF5F5; gridline-color:#F3C2C2; }
@@ -621,7 +915,7 @@ class OBSPartsTab(QWidget):
             QComboBox { border:1px solid #E3AEB2; border-radius:4px; padding:2px 6px; }
         """)
 
-        delete_btn.clicked.connect(self.table.delete_selected_rows)
+        delete_btn.clicked.connect(self.delete_selected_rows_with_sync)
         btn_template.clicked.connect(self.download_template)
         btn_upload.clicked.connect(self.upload_from_excel)
         btn_copy_obs.clicked.connect(self.copy_obs_parts)
@@ -631,6 +925,320 @@ class OBSPartsTab(QWidget):
         btn_export_obs.clicked.connect(self.export_obs_list)
         # (WU controls moved to Where Used tab)
         self.where_used_tab = None  # linked by MainWindow after both tabs are created
+
+    def _ensure_orphan_hierarchy_tab(self):
+        if self.orphan_hierarchy_tab is not None and self.orphan_hierarchy_table is not None:
+            return
+        self.orphan_hierarchy_tab = QWidget(self)
+        lay = QVBoxLayout(self.orphan_hierarchy_tab)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+
+        self.orphan_hierarchy_table = QTableWidget(0, 5, self.orphan_hierarchy_tab)
+        self.orphan_hierarchy_table.setHorizontalHeaderLabels([
+            'BOM Level',
+            'Part Hierarchy',
+            'Identified Orphans',
+            'Change',
+            'Replacement',
+        ])
+        self.orphan_hierarchy_table.verticalHeader().setVisible(False)
+        self.orphan_hierarchy_table.setAlternatingRowColors(True)
+        self.orphan_hierarchy_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.orphan_hierarchy_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.orphan_hierarchy_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        try:
+            hh = self.orphan_hierarchy_table.horizontalHeader()
+            hh.setStretchLastSection(False)
+            hh.setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
+            hh.setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
+            hh.setSectionResizeMode(2, QHeaderView.ResizeMode.Interactive)
+            hh.setSectionResizeMode(3, QHeaderView.ResizeMode.Interactive)
+            hh.setSectionResizeMode(4, QHeaderView.ResizeMode.Interactive)
+            self.orphan_hierarchy_table.setColumnWidth(0, _excel_width_to_px(self.orphan_hierarchy_table, 10))
+            self.orphan_hierarchy_table.setColumnWidth(1, _excel_width_to_px(self.orphan_hierarchy_table, 34))
+            self.orphan_hierarchy_table.setColumnWidth(2, _excel_width_to_px(self.orphan_hierarchy_table, 18))
+            self.orphan_hierarchy_table.setColumnWidth(3, _excel_width_to_px(self.orphan_hierarchy_table, 14))
+            self.orphan_hierarchy_table.setColumnWidth(4, _excel_width_to_px(self.orphan_hierarchy_table, 18))
+        except Exception:
+            pass
+
+        lay.addWidget(self.orphan_hierarchy_table)
+        self.subtabs.addTab(self.orphan_hierarchy_tab, 'Orphan Hierarchy')
+
+    def update_orphan_hierarchy_view(self, orphan_blocks: List[Dict[str, Any]], wu_replacement_map=None):
+        """Append-only hierarchy renderer using flat Block groups.
+
+        - Structure comes from WU orphan blocks only.
+        - Final OBS List is used for orphan labels/change/replacement lookups.
+        - Existing hierarchy rows are preserved; only new relations are appended.
+        """
+        t = self.table
+
+        rows = []
+        for r in range(t.rowCount()):
+            pit = t.item(r, 1)
+            part = (pit.text() if pit else '').strip()
+            if not part:
+                continue
+
+            change_val = ''
+            cw = t.cellWidget(r, 2)
+            if isinstance(cw, QComboBox):
+                change_val = (cw.currentText() or '').strip()
+            else:
+                cit = t.item(r, 2)
+                change_val = (cit.text() if cit else '').strip()
+
+            rep_it = t.item(r, 3)
+            rep_val = (rep_it.text() if rep_it else '').strip()
+
+            identified = ''
+            for c in range(t.columnCount()):
+                h = t.horizontalHeaderItem(c)
+                if h and h.text().strip().lower() == 'identified orphans':
+                    iit = t.item(r, c)
+                    identified = (iit.text() if iit else '').strip()
+                    break
+
+            rows.append({
+                'idx': r,
+                'part': part,
+                'key': part.upper(),
+                'identified': identified,
+                'change': change_val,
+                'replacement': rep_val,
+            })
+
+        if not rows:
+            # Final OBS List is empty: reset and hide Orphan Hierarchy tab.
+            if self.orphan_hierarchy_table is not None:
+                self.orphan_hierarchy_table.setRowCount(0)
+            if self.orphan_hierarchy_tab is not None:
+                idx = self.subtabs.indexOf(self.orphan_hierarchy_tab)
+                if idx >= 0:
+                    self.subtabs.removeTab(idx)
+            return
+
+        self._ensure_orphan_hierarchy_tab()
+        ht = self.orphan_hierarchy_table
+        if ht is None:
+            return
+
+        if not orphan_blocks:
+            ht.setRowCount(0)
+            return
+
+        by_key: Dict[str, dict] = {}
+        label_by_key: Dict[str, str] = {}
+        for row in rows:
+            if row['key'] not in by_key:
+                by_key[row['key']] = row
+            lbl = (row.get('identified') or '').strip()
+            if lbl:
+                label_by_key[row['key']] = lbl
+
+        wu_replacement_map = wu_replacement_map or {}
+
+        def _row_for_part(part_key: str) -> dict:
+            row = by_key.get(part_key)
+            if row:
+                rep = (row.get('replacement') or '').strip()
+                if not rep:
+                    rep = (wu_replacement_map.get(part_key, '') or '').strip()
+                out = dict(row)
+                out['replacement'] = rep
+                return out
+            return {
+                'part': part_key,
+                'key': part_key,
+                'identified': '',
+                'change': '',
+                'replacement': (wu_replacement_map.get(part_key, '') or '').strip(),
+            }
+
+        def _parse_level(row_idx: int):
+            it = ht.item(row_idx, 0)
+            txt = (it.text() if it else '').strip()
+            if not txt:
+                return None
+            try:
+                return int(txt)
+            except ValueError:
+                return None
+
+        def _part_at(row_idx: int) -> str:
+            it = ht.item(row_idx, 1)
+            return (it.text() if it else '').strip()
+
+        def _part_key_at(row_idx: int) -> str:
+            return _part_at(row_idx).strip().upper()
+
+        def _write_hierarchy_row(row_idx: int, level: int, part_key: str, is_header: bool = False):
+            if is_header:
+                ht.setItem(row_idx, 0, QTableWidgetItem(''))
+                head = QTableWidgetItem(part_key)
+                _f = head.font(); _f.setBold(True); head.setFont(_f)
+                ht.setItem(row_idx, 1, head)
+                ht.setItem(row_idx, 2, QTableWidgetItem(''))
+                ht.setItem(row_idx, 3, QTableWidgetItem(''))
+                ht.setItem(row_idx, 4, QTableWidgetItem(''))
+                return
+
+            row = _row_for_part(part_key)
+            indent = '    ' * max(0, level)
+            ht.setItem(row_idx, 0, QTableWidgetItem(str(max(0, level))))
+            ht.setItem(row_idx, 1, QTableWidgetItem(f"{indent}{row.get('part', part_key)}"))
+            ht.setItem(row_idx, 2, QTableWidgetItem(row.get('identified', '')))
+            ht.setItem(row_idx, 3, QTableWidgetItem(row.get('change', '')))
+            ht.setItem(row_idx, 4, QTableWidgetItem(row.get('replacement', '')))
+
+        def _find_last_row_for_part(part_key: str):
+            key = (part_key or '').strip().upper()
+            found = -1
+            for rr in range(ht.rowCount()):
+                if _part_key_at(rr) == key:
+                    found = rr
+            return found
+
+        def _subtree_end(anchor_row: int):
+            base_lvl = _parse_level(anchor_row)
+            if base_lvl is None:
+                return anchor_row
+            end = anchor_row
+            for rr in range(anchor_row + 1, ht.rowCount()):
+                lvl = _parse_level(rr)
+                if lvl is None:
+                    break
+                if lvl <= base_lvl:
+                    break
+                end = rr
+            return end
+
+        def _parent_child_pairs_existing():
+            pairs = set()
+            stack: List[tuple[int, str]] = []
+            for rr in range(ht.rowCount()):
+                lvl = _parse_level(rr)
+                if lvl is None:
+                    stack.clear()
+                    continue
+                part_key = _part_key_at(rr)
+                if not part_key:
+                    continue
+                while stack and stack[-1][0] >= lvl:
+                    stack.pop()
+                if stack:
+                    pairs.add((stack[-1][1], part_key))
+                stack.append((lvl, part_key))
+            return pairs
+
+        def _next_block_label() -> str:
+            max_block = 0
+            for rr in range(ht.rowCount()):
+                if _parse_level(rr) is not None:
+                    continue
+                txt = _part_at(rr).strip()
+                if not txt.lower().startswith('block '):
+                    continue
+                try:
+                    num = int(txt.split(' ', 1)[1].strip())
+                    if num > max_block:
+                        max_block = num
+                except Exception:
+                    continue
+            return f'Block {max_block + 1}'
+
+        # Remove scope section rows if present from previous runs.
+        for rr in range(ht.rowCount() - 1, -1, -1):
+            if _parse_level(rr) is not None:
+                continue
+            txt = _part_at(rr).strip().lower()
+            if txt in ('=== original scope ===', '=== orphan parents scope (extended) ==='):
+                ht.removeRow(rr)
+
+        # Refresh existing hierarchy row values so Replacement gets filled after each run.
+        for rr in range(ht.rowCount()):
+            lvl = _parse_level(rr)
+            if lvl is None:
+                continue
+            part_key = _part_key_at(rr)
+            if not part_key:
+                continue
+            row = _row_for_part(part_key)
+            ht.setItem(rr, 2, QTableWidgetItem(row.get('identified', '')))
+            ht.setItem(rr, 3, QTableWidgetItem(row.get('change', '')))
+            ht.setItem(rr, 4, QTableWidgetItem(row.get('replacement', '')))
+
+        existing_edges = _parent_child_pairs_existing()
+
+        def _is_orphan_parent_part(part_key: str) -> bool:
+            lbl = (label_by_key.get(part_key, '') or '').strip().lower()
+            return lbl.startswith('orphan')
+
+        def _append_group(header_label: str, parents: List[str], child_key: str):
+            insert_at = ht.rowCount()
+            ht.insertRow(insert_at)
+            _write_hierarchy_row(insert_at, 0, header_label, is_header=True)
+
+            current = insert_at + 1
+            for p in parents:
+                ht.insertRow(current)
+                _write_hierarchy_row(current, 0, p)
+                current += 1
+
+            ht.insertRow(current)
+            _write_hierarchy_row(current, 1, child_key)
+
+        for block in orphan_blocks:
+            parents = [(p or '').strip().upper() for p in (block.get('parents', []) or [])]
+            parents = [p for p in parents if p]
+            uniq_parents = []
+            for p in parents:
+                if p not in uniq_parents:
+                    uniq_parents.append(p)
+            parents = uniq_parents
+
+            child_key = (block.get('child') or '').strip().upper()
+            if not child_key:
+                continue
+
+            if any((p, child_key) in existing_edges for p in parents):
+                continue
+
+            orphan_parent_roots = [p for p in parents if _is_orphan_parent_part(p)]
+
+            if orphan_parent_roots:
+                for op in orphan_parent_roots:
+                    if (op, child_key) in existing_edges:
+                        continue
+                    anchor = _find_last_row_for_part(op)
+                    if anchor >= 0:
+                        lvl = _parse_level(anchor)
+                        if lvl is None:
+                            lvl = 0
+                        at = _subtree_end(anchor) + 1
+                        ht.insertRow(at)
+                        _write_hierarchy_row(at, lvl + 1, child_key)
+                    else:
+                        _append_group(_next_block_label(), [op], child_key)
+                    existing_edges.add((op, child_key))
+            else:
+                _append_group(_next_block_label(), parents, child_key)
+                for p in parents:
+                    existing_edges.add((p, child_key))
+
+        if self.subtabs.indexOf(self.orphan_hierarchy_tab) >= 0:
+            self.subtabs.setCurrentWidget(self.orphan_hierarchy_tab)
+
+    def update_proposed_replacement_note_visibility(self, visible=None):
+        if visible is None:
+            visible = any(
+                (self.table.horizontalHeaderItem(c)
+                 and self.table.horizontalHeaderItem(c).text().strip().lower() == 'proposed replacement')
+                for c in range(self.table.columnCount())
+            )
+        self.proposed_replacement_note.setVisible(bool(visible))
 
     def download_template(self):
         try:
@@ -677,7 +1285,7 @@ class OBSPartsTab(QWidget):
                 obs=as_text(r.get(c_obs,''))
                 if not obs: continue
                 change_val=as_text(r.get(c_change,'Obsolete')) if c_change else 'Obsolete'
-                if change_val not in ['Obsolete','Inactivate']: change_val='Obsolete'
+                if change_val not in ['', 'Obsolete','Inactivate']: change_val='Obsolete'
                 rep=as_text(r.get(c_rep,'')) if c_rep else ''
                 rows.append((obs,change_val,rep))
             if not rows:
@@ -879,6 +1487,7 @@ class OBSPartsTab(QWidget):
 
         if all_accepted:
             t.removeColumn(prop_col)
+            self.update_proposed_replacement_note_visibility(False)
 
         # Update Where Used tab if available
         if self.where_used_tab is not None and accepted_map:
@@ -2389,41 +2998,40 @@ class WhereUsedTabV2(WhereUsedTab):
                     )
                 return
 
-            # Compose output rows: Option first (BOM Level 0), linked rows next (BOM Level 1).
+            # Compose output rows by reversing WU hierarchy into BOM hierarchy:
+            # highest WU level becomes BOM 0, then descend (0 -> deepest BOM level).
             out_rows = []
 
-            def _split_ws(val: str):
-                raw = val or ''
-                body = raw.lstrip(' \t')
-                ws = raw[:len(raw) - len(body)]
-                return ws, body
+            def _row_wu_level(vals: list[str]) -> int:
+                if wu_out_idx < 0 or wu_out_idx >= len(vals):
+                    return -1
+                try:
+                    return int(float((vals[wu_out_idx] or '').strip()))
+                except Exception:
+                    return -1
 
             for opt_key in option_order:
                 grp = option_groups[opt_key]
-                opt_row = list(grp['option_row'])
-                if wu_out_idx >= 0 and wu_out_idx < len(opt_row):
-                    opt_row[wu_out_idx] = '0'
+                group_rows = [list(grp['option_row'])] + [list(ch) for ch in grp['children']]
 
-                child_rows = [list(ch) for ch in grp['children']]
+                # Sort by WU desc so parent chain appears above child chain in Structure Sheet.
+                indexed = list(enumerate(group_rows))
+                indexed.sort(key=lambda ir: (-_row_wu_level(ir[1]), ir[0]))
+                ordered_rows = [ir[1] for ir in indexed]
 
-                # Swap indentation between option and first linked row in Part column.
-                if part_out_idx >= 0 and child_rows:
-                    opt_part = opt_row[part_out_idx] if part_out_idx < len(opt_row) else ''
-                    ch_part = child_rows[0][part_out_idx] if part_out_idx < len(child_rows[0]) else ''
-                    opt_ws, opt_body = _split_ws(opt_part)
-                    ch_ws, ch_body = _split_ws(ch_part)
-                    if part_out_idx < len(opt_row):
-                        opt_row[part_out_idx] = ch_ws + opt_body
-                    if part_out_idx < len(child_rows[0]):
-                        child_rows[0][part_out_idx] = opt_ws + ch_body
+                valid_wu = [_row_wu_level(r) for r in ordered_rows if _row_wu_level(r) >= 0]
+                max_wu = max(valid_wu) if valid_wu else 0
 
-                out_rows.append(opt_row)
+                for seq, src_row in enumerate(ordered_rows):
+                    mapped_row = list(src_row)
+                    wu_here = _row_wu_level(src_row)
 
-                for child in child_rows:
-                    c_row = list(child)
-                    if wu_out_idx >= 0 and wu_out_idx < len(c_row):
-                        c_row[wu_out_idx] = '1'
-                    out_rows.append(c_row)
+                    # Reverse WU->BOM (WU max => BOM 0, WU 0 => BOM max).
+                    bom_level = (max_wu - wu_here) if wu_here >= 0 else seq
+                    if wu_out_idx >= 0 and wu_out_idx < len(mapped_row):
+                        mapped_row[wu_out_idx] = str(max(0, bom_level))
+
+                    out_rows.append(mapped_row)
 
             # Build final headers (prepend Select and new columns, remove dropped columns,
             # and avoid duplicate Change Type from source section).
@@ -2585,6 +3193,180 @@ class WhereUsedTabV2(WhereUsedTab):
                     )
                     move_mode = 'replace'
 
+            # Item Seq correction:
+            # - BOM Level 0 rows must be blank.
+            # - BOM Level >= 1 rows should use Implemented BOM item_seq by parent->child edge.
+            try:
+                bom_idx = next((i for i, h in enumerate(final_headers) if _norm_header(h) == 'bom level'), -1)
+                part_idx = next((i for i, h in enumerate(final_headers) if _norm_header(h) == 'part'), -1)
+                item_seq_idx = next((i for i, h in enumerate(final_headers) if _norm_header(h) == 'item seq'), -1)
+                plant_idx = next((i for i, h in enumerate(final_headers) if _norm_header(h) == 'plant'), -1)
+
+                if bom_idx >= 0 and part_idx >= 0 and item_seq_idx >= 0 and final_rows:
+                    parent_roots = []
+                    seen_roots = set()
+                    max_bom = 1
+                    plant_val = ''
+
+                    for row in final_rows:
+                        bom_txt = (row[bom_idx] if bom_idx < len(row) else '') or ''
+                        part_txt = ((row[part_idx] if part_idx < len(row) else '') or '').lstrip(' \t').strip().upper()
+
+                        if not plant_val and plant_idx >= 0 and plant_idx < len(row):
+                            plant_val = str(row[plant_idx] or '').strip()
+
+                        try:
+                            bom_int = int(float(str(bom_txt).strip()))
+                        except Exception:
+                            bom_int = -1
+
+                        if bom_int > max_bom:
+                            max_bom = bom_int
+
+                        if bom_int == 0 and part_txt and part_txt not in seen_roots:
+                            parent_roots.append(part_txt)
+                            seen_roots.add(part_txt)
+
+                    if parent_roots:
+                        try:
+                            from implemented_bom_query import fetch_implemented_bom  # type: ignore[import]
+
+                            if not plant_val:
+                                plant_val = (self.plant_combo.currentText() or '').strip() if hasattr(self, 'plant_combo') else ''
+                            if not plant_val:
+                                plant_val = '4070'
+
+                            impl_rows = fetch_implemented_bom(
+                                parent_roots,
+                                max_level=max(1, min(18, max_bom)),
+                                plant=plant_val,
+                                include_level0=False,
+                            )
+                        except Exception:
+                            impl_rows = []
+
+                        seq_by_edge = {}
+                        for rec in impl_rows:
+                            parent_part = str(rec.get('parent_part', '') or '').strip().upper()
+                            child_part = str(rec.get('part', '') or '').strip().upper()
+                            seq_val = str(rec.get('item_seq', '') or '').strip()
+                            if not parent_part or not child_part or not seq_val:
+                                continue
+                            key = (parent_part, child_part)
+                            if key not in seq_by_edge:
+                                seq_by_edge[key] = seq_val
+
+                        current_part_at_level = {}
+                        for row in final_rows:
+                            bom_txt = (row[bom_idx] if bom_idx < len(row) else '') or ''
+                            part_txt = ((row[part_idx] if part_idx < len(row) else '') or '').lstrip(' \t').strip().upper()
+
+                            try:
+                                bom_int = int(float(str(bom_txt).strip()))
+                            except Exception:
+                                bom_int = -1
+
+                            if bom_int == 0:
+                                if item_seq_idx < len(row):
+                                    row[item_seq_idx] = ''
+                            elif bom_int > 0:
+                                parent_part = ''
+                                for lv in range(bom_int - 1, -1, -1):
+                                    cand = current_part_at_level.get(lv, '')
+                                    if cand:
+                                        parent_part = cand
+                                        break
+
+                                mapped_seq = seq_by_edge.get((parent_part, part_txt), '') if parent_part and part_txt else ''
+                                if mapped_seq and item_seq_idx < len(row):
+                                    row[item_seq_idx] = mapped_seq
+
+                            if part_txt and bom_int >= 0:
+                                current_part_at_level[bom_int] = part_txt
+                                prune_levels = [lv for lv in current_part_at_level.keys() if lv > bom_int]
+                                for lv in prune_levels:
+                                    current_part_at_level.pop(lv, None)
+            except Exception:
+                pass
+
+            # Remove duplicate parent blocks in Structure output.
+            # Block rule: starts at BOM Level 0 and ends right before next BOM Level 0.
+            # Merge rule: same parent part => keep first parent row, keep unique child parts only.
+            try:
+                bom_idx = next((i for i, h in enumerate(final_headers) if _norm_header(h) == 'bom level'), -1)
+                part_idx = next((i for i, h in enumerate(final_headers) if _norm_header(h) == 'part'), -1)
+
+                if bom_idx >= 0 and part_idx >= 0 and final_rows:
+                    blocks = []
+                    orphan_rows = []
+                    current_block = None
+
+                    for row in final_rows:
+                        bom_txt = (row[bom_idx] if bom_idx < len(row) else '') or ''
+                        part_txt = ((row[part_idx] if part_idx < len(row) else '') or '').lstrip(' \t').strip()
+                        try:
+                            bom_int = int(float(str(bom_txt).strip()))
+                        except Exception:
+                            bom_int = -1
+
+                        if bom_int == 0:
+                            if current_block is not None:
+                                blocks.append(current_block)
+                            current_block = {
+                                'parent_row': list(row),
+                                'parent_key': part_txt.upper(),
+                                'children': [],
+                            }
+                        else:
+                            if current_block is None:
+                                orphan_rows.append(list(row))
+                            else:
+                                current_block['children'].append(list(row))
+
+                    if current_block is not None:
+                        blocks.append(current_block)
+
+                    if blocks:
+                        merged_order = []
+                        merged = {}
+
+                        for blk in blocks:
+                            pkey = blk.get('parent_key', '') or ''
+                            if not pkey:
+                                # Parent row exists but part is blank; preserve as standalone.
+                                orphan_rows.append(list(blk.get('parent_row', [])))
+                                orphan_rows.extend([list(r) for r in blk.get('children', [])])
+                                continue
+
+                            if pkey not in merged:
+                                merged_order.append(pkey)
+                                merged[pkey] = {
+                                    'parent_row': list(blk.get('parent_row', [])),
+                                    'children': [],
+                                    'seen_child_parts': set(),
+                                }
+
+                            group = merged[pkey]
+                            for crow in blk.get('children', []):
+                                cpart = ((crow[part_idx] if part_idx < len(crow) else '') or '').lstrip(' \t').strip().upper()
+                                if not cpart or cpart in group['seen_child_parts']:
+                                    continue
+                                group['children'].append(list(crow))
+                                group['seen_child_parts'].add(cpart)
+
+                        dedup_rows = []
+                        for pkey in merged_order:
+                            group = merged[pkey]
+                            dedup_rows.append(group['parent_row'])
+                            dedup_rows.extend(group['children'])
+
+                        if orphan_rows:
+                            dedup_rows.extend(orphan_rows)
+
+                        final_rows = dedup_rows
+            except Exception:
+                pass
+
             # Replace Structure Sheet table with rearranged, de-duplicated grouped output.
             t = target.table
             _bulk_guard = hasattr(target, '_struct_item_change_guard')
@@ -2700,7 +3482,11 @@ class WhereUsedTabV2(WhereUsedTab):
                             if c == part_col:
                                 part_txt = ((val or '') if isinstance(val, str) else str(val or '')).lstrip(' \t')
                                 bom_here = (str(row[bom_col]).strip() if (bom_col >= 0 and bom_col < len(row)) else '')
-                                display_val = part_txt if bom_here == '0' else ('      ' + part_txt if part_txt else '')
+                                try:
+                                    bom_int = max(0, int(float(bom_here)))
+                                except Exception:
+                                    bom_int = 0
+                                display_val = ('      ' * bom_int + part_txt) if part_txt else ''
 
                             item = QTableWidgetItem(display_val)
                             if c == part_col:
@@ -3299,18 +4085,19 @@ class StructureSheetTab(QWidget):
                 return True
         return False
 
-    def _apply_action_checkbox_visibility(self, row_idx: int, action: str):
+    def _apply_action_checkbox_visibility(self, row_idx: int, action: str, reset_checks: bool = True):
         """Apply checkbox visibility rules based on action and BOM level."""
         bom_level = self._get_bom_level_for_row(row_idx)
         is_option = self._is_option_part_in_row(row_idx)
         has_kit_code = self._row_has_kit_code_value(row_idx)
         visible_cols = set()
-        for col in {2, 3, 4, 5, 6}:
-            w = self.table.cellWidget(row_idx, col)
-            if w and hasattr(w, '_chk'):
-                w._chk.blockSignals(True)
-                w._chk.setChecked(False)
-                w._chk.blockSignals(False)
+        if reset_checks:
+            for col in {2, 3, 4, 5, 6}:
+                w = self.table.cellWidget(row_idx, col)
+                if w and hasattr(w, '_chk'):
+                    w._chk.blockSignals(True)
+                    w._chk.setChecked(False)
+                    w._chk.blockSignals(False)
         if bom_level == '0':
             if action == 'Revised':
                 visible_cols = {2, 6}
@@ -3353,7 +4140,8 @@ class StructureSheetTab(QWidget):
         if self.table.rowCount() <= 0:
             return
         for r in range(self.table.rowCount()):
-            self._apply_action_checkbox_visibility(r, self._current_change_type(r))
+            # Preserve user-entered selector choices while refreshing UI after tab switches.
+            self._apply_action_checkbox_visibility(r, self._current_change_type(r), reset_checks=False)
             self._update_inserted_editability_for_row(r)
 
     def _confirm_struct_action_change(self) -> bool:
@@ -4722,11 +5510,20 @@ class StructureSheetTab(QWidget):
 
                 # Special handling for New Kit Code: use dropdown
                 if new_header.lower() == 'new kit code':
-                    kit_codes = fetch_distinct_kit_codes(self.cmb_build_plant.currentText() if hasattr(self, 'cmb_build_plant') else '4070')
+                    plant_val = (self.cmb_build_plant.currentText() or '').strip() if hasattr(self, 'cmb_build_plant') else '4070'
+                    try:
+                        kit_codes = fetch_distinct_kit_codes(plant_val)
+                        if not kit_codes:
+                            print(f"WARNING: No kit codes found for plant '{plant_val}'. Dropdown will be empty.")
+                    except Exception as e:
+                        print(f"ERROR fetching kit codes for plant '{plant_val}': {e}")
+                        kit_codes = []
+                    
                     for r in range(self.table.rowCount()):
                         combo = QComboBox()
                         combo.addItem("")
-                        combo.addItems(kit_codes)
+                        if kit_codes:
+                            combo.addItems(kit_codes)
                         combo.setEditable(True)
                         combo.setStyleSheet('QComboBox { padding: 2px; }')
                         selector_col = self.INSERTED_COL_TO_SELECTOR[new_header.lower()]
@@ -6933,6 +7730,8 @@ class WURemovedBOMItemsTab(QWidget):
 
         # If already present and already placed after Replacement, reuse it.
         if existing_idx >= 0 and replacement_idx >= 0 and existing_idx == (replacement_idx + 1):
+            if hasattr(self.obs_provider, 'update_proposed_replacement_note_visibility'):
+                self.obs_provider.update_proposed_replacement_note_visibility(True)
             return existing_idx
 
         insert_at = replacement_idx + 1 if replacement_idx >= 0 else t.columnCount()
@@ -6955,6 +7754,8 @@ class WURemovedBOMItemsTab(QWidget):
             t.setColumnWidth(insert_at, px)
         except Exception:
             pass
+        if hasattr(self.obs_provider, 'update_proposed_replacement_note_visibility'):
+            self.obs_provider.update_proposed_replacement_note_visibility(True)
         return insert_at
 
     @staticmethod
@@ -7078,9 +7879,18 @@ class WURemovedBOMItemsTab(QWidget):
         return {k: ', '.join(v) for k, v in proposed.items()}
 
     def _is_obs_orphan_row(self, row: int, change_col: int) -> bool:
+        """Return True when the OBS table row represents an orphan (identified by the
+        'Identified Orphans' column, falling back to the Change column for rows written
+        before that column existed)."""
         if not self.obs_provider or not hasattr(self.obs_provider, 'table'):
             return False
         t = self.obs_provider.table
+        # Primary check: dedicated 'Identified Orphans' column
+        id_orphan_col = self._find_obs_col('Identified Orphans')
+        if id_orphan_col >= 0:
+            it = t.item(row, id_orphan_col)
+            return bool(it and (it.text() or '').strip().lower().startswith('orphan'))
+        # Legacy fallback: Change column starts with 'orphan'
         w = t.cellWidget(row, change_col)
         if isinstance(w, QComboBox):
             return (w.currentText() or '').strip().lower().startswith('orphan')
@@ -7120,6 +7930,104 @@ class WURemovedBOMItemsTab(QWidget):
             if (it.text() or '') != value:
                 it.setText(value)
 
+    def _ensure_obs_identified_orphans_column(self) -> int:
+        """Ensure OBS table has 'Identified Orphans' column immediately after 'Replacement'
+        (or after 'Proposed Replacement' when that column is also present)."""
+        if not self.obs_provider or not hasattr(self.obs_provider, 'table'):
+            return -1
+        t = self.obs_provider.table
+        existing_idx = self._find_obs_col('Identified Orphans')
+        # Determine desired position: after 'Proposed Replacement' if it exists, else after 'Replacement'.
+        anchor_col = self._find_obs_col('Proposed Replacement')
+        if anchor_col < 0:
+            anchor_col = self._find_obs_col('Replacement')
+        insert_at = anchor_col + 1 if anchor_col >= 0 else t.columnCount()
+
+        if existing_idx >= 0 and existing_idx == insert_at:
+            return existing_idx
+
+        if existing_idx >= 0 and existing_idx != insert_at:
+            t.removeColumn(existing_idx)
+            if existing_idx < insert_at:
+                insert_at -= 1
+            existing_idx = -1
+
+        if existing_idx < 0:
+            t.insertColumn(insert_at)
+            t.setHorizontalHeaderItem(insert_at, QTableWidgetItem('Identified Orphans'))
+            for r in range(t.rowCount()):
+                if t.item(r, insert_at) is None:
+                    t.setItem(r, insert_at, QTableWidgetItem(''))
+            try:
+                px = _excel_width_to_px(t, 16)
+                t.setColumnWidth(insert_at, px)
+            except Exception:
+                pass
+        return insert_at
+
+    def _get_orphan_parent_change_value(self, part: str) -> str:
+        """Look up the immediate level-1 parent of *part* in the WU table and return
+        its Change value ('Obsolete' or 'Inactivate') from the OBS Parts table.
+        Falls back to 'Obsolete' when no parent mapping is found."""
+        pcol = self._find_col('Part')
+        wucol = self._find_col('WU Level')
+        if pcol < 0 or wucol < 0:
+            return 'Obsolete'
+        part_upper = part.strip().upper()
+        obs_change_map = self._build_obs_change_map()  # {PART_UPPER: 'Obsolete'/'Inactivate'}
+        row_count = self.table.rowCount()
+        for r in range(row_count):
+            wu_it = self.table.item(r, wucol)
+            wu_val = (wu_it.text() if wu_it else '').strip()
+            # Find a WU Level 0 row matching this part
+            if wu_val not in ('0', '0.0'):
+                continue
+            pit = self.table.item(r, pcol)
+            if not pit or pit.text().strip().upper() != part_upper:
+                continue
+            # Found the block root row for this part; scan for WU level 1 parents
+            block_end = row_count
+            for i in range(r + 1, row_count):
+                nxt = self.table.item(i, wucol)
+                if nxt and nxt.text().strip() in ('0', '0.0'):
+                    block_end = i
+                    break
+            for i in range(r + 1, block_end):
+                wu_p = self.table.item(i, wucol)
+                if not wu_p or wu_p.text().strip() not in ('1', '1.0'):
+                    continue
+                parent_pit = self.table.item(i, pcol)
+                parent_part = (parent_pit.text().lstrip() if parent_pit else '').strip().upper()
+                if parent_part in obs_change_map:
+                    chg = obs_change_map[parent_part].strip()
+                    if chg in ('Obsolete', 'Inactivate'):
+                        return chg
+        return 'Obsolete'
+
+    def _set_obs_change_value(self, row: int, value: str):
+        """Ensure Change column has a combo box and set it to value.
+        Allowed values are '', 'Obsolete', 'Inactivate'."""
+        if not self.obs_provider or not hasattr(self.obs_provider, 'table'):
+            return
+        t = self.obs_provider.table
+        change_col = self._find_obs_col('Change')
+        if change_col < 0:
+            change_col = 2
+
+        cw = t.cellWidget(row, change_col)
+        if not isinstance(cw, QComboBox):
+            # Remove any stale text item and restore dropdown behavior.
+            t.setItem(row, change_col, QTableWidgetItem(''))
+            cw = QComboBox()
+            cw.addItems(['', 'Obsolete', 'Inactivate'])
+            t.setCellWidget(row, change_col, cw)
+
+        idx = cw.findText(value)
+        if idx < 0:
+            idx = 0
+        cw.setCurrentIndex(idx)
+        cw.setStyleSheet('')
+
     def append_orphans_to_obs_parts(self, remove_from_orphan_table=False, include_orphan_parent=False):
         if not self.obs_provider:
             return
@@ -7149,19 +8057,50 @@ class WURemovedBOMItemsTab(QWidget):
         orphan_parts = set(orphan_map.keys())
         proposed_by_part = self._build_proposed_replacement_map_for_orphans(orphan_parts)
         proposed_col = self._ensure_obs_proposed_replacement_column()
+        id_orphan_col = self._ensure_obs_identified_orphans_column()
         t = self.obs_provider.table
+        # Refresh column indices after possible insertions above
+        change_col = self._find_obs_col('Change')
+        if change_col < 0:
+            change_col = 2
         existing = {t.item(r,1).text().strip().upper() for r in range(t.rowCount()) if t.item(r,1) and t.item(r,1).text().strip()}
         added_items = []
         for part, lvl in orphan_map.items():
             if part in existing:
-                # Refresh proposed replacement for existing orphan rows.
-                if proposed_col >= 0:
-                    for rr in range(t.rowCount()):
-                        pit = t.item(rr, 1)
-                        if not pit or (pit.text() or '').strip().upper() != part:
+                # Refresh 'Identified Orphans' label, Change value, and proposed replacement
+                # for existing orphan rows.
+                for rr in range(t.rowCount()):
+                    pit = t.item(rr, 1)
+                    if not pit or (pit.text() or '').strip().upper() != part:
+                        continue
+                    if not self._is_obs_orphan_row(rr, change_col):
+                        # Also check if this row previously had the label in Change (legacy)
+                        id_col_check = self._find_obs_col('Identified Orphans')
+                        if id_col_check >= 0:
+                            id_it = t.item(rr, id_col_check)
+                            if not (id_it and (id_it.text() or '').strip().lower().startswith('orphan')):
+                                continue
+                        else:
                             continue
-                        if not self._is_obs_orphan_row(rr, 2):
-                            continue
+                    # Update 'Identified Orphans' column
+                    if id_orphan_col >= 0:
+                        id_it = t.item(rr, id_orphan_col)
+                        if id_it is None:
+                            id_it = QTableWidgetItem('')
+                            t.setItem(rr, id_orphan_col, id_it)
+                        id_it.setText(lvl)
+                        _bold_f = id_it.font(); _bold_f.setBold(True); id_it.setFont(_bold_f)
+                        col = get_orphan_color(lvl)
+                        if col:
+                            id_it.setForeground(col)
+                    # Keep Change blank for Orphan Parent; otherwise set Obsolete/Inactivate.
+                    if lvl.strip().lower() == 'orphan parent':
+                        self._set_obs_change_value(rr, '')
+                    else:
+                        change_val = self._get_orphan_parent_change_value(part)
+                        self._set_obs_change_value(rr, change_val)
+                    # Update proposed replacement
+                    if proposed_col >= 0:
                         val = proposed_by_part.get(part, '')
                         it = t.item(rr, proposed_col)
                         if it is None:
@@ -7172,13 +8111,23 @@ class WURemovedBOMItemsTab(QWidget):
             target = next((r for r in range(t.rowCount()) if not t.item(r,1) or not t.item(r,1).text().strip()), None)
             if target is None:
                 target = t.rowCount(); t.setRowCount(target+1); t._init_rows(target,target+1)
-            t.setItem(target,1,QTableWidgetItem(part))
-            cb = QComboBox(); cb.addItem(lvl); cb.setCurrentText(lvl)
-            col = get_orphan_color(lvl)
-            if col: cb.setStyleSheet(f"QComboBox {{ color:{col.name()}; font-weight:bold; }}")
-            t.setCellWidget(target,2,cb)
+            t.setItem(target, 1, QTableWidgetItem(part))
+            # 'Identified Orphans' column: set the orphan label with colour and bold
+            if id_orphan_col >= 0:
+                id_it = QTableWidgetItem(lvl)
+                _bold_f = id_it.font(); _bold_f.setBold(True); id_it.setFont(_bold_f)
+                col = get_orphan_color(lvl)
+                if col:
+                    id_it.setForeground(col)
+                t.setItem(target, id_orphan_col, id_it)
+            # Change column: keep blank for Orphan Parent, otherwise set Obsolete/Inactivate.
+            if lvl.strip().lower() == 'orphan parent':
+                self._set_obs_change_value(target, '')
+            else:
+                change_val = self._get_orphan_parent_change_value(part)
+                self._set_obs_change_value(target, change_val)
             replacement_text = '' if self.prompt_replacement_update_for_orphans else 'OBSOLETE: NO REPLACEMENT'
-            t.setItem(target,3,QTableWidgetItem(replacement_text))
+            t.setItem(target, 3, QTableWidgetItem(replacement_text))
             if proposed_col >= 0:
                 proposed_val = proposed_by_part.get(part, '')
                 t.setItem(target, proposed_col, QTableWidgetItem(proposed_val))
@@ -7339,6 +8288,11 @@ class WURemovedBOMItemsTab(QWidget):
             return
 
         t = self.obs_provider.table
+        id_orphan_col = self._ensure_obs_identified_orphans_column()
+        change_col = self._find_obs_col('Change')
+        if change_col < 0:
+            change_col = 2
+
         existing = {
             t.item(r,1).text().strip().upper()
             for r in range(t.rowCount())
@@ -7348,15 +8302,40 @@ class WURemovedBOMItemsTab(QWidget):
         added = 0
         for part, lvl in orphan_parents:
             if part in existing:
+                # Refresh existing row: keep Change blank and set marker in Identified Orphans.
+                for rr in range(t.rowCount()):
+                    pit = t.item(rr, 1)
+                    if not pit or (pit.text() or '').strip().upper() != part:
+                        continue
+                    if id_orphan_col >= 0:
+                        id_it = t.item(rr, id_orphan_col)
+                        if id_it is None:
+                            id_it = QTableWidgetItem('')
+                            t.setItem(rr, id_orphan_col, id_it)
+                        id_it.setText(lvl)
+                        _bold_f = id_it.font(); _bold_f.setBold(True); id_it.setFont(_bold_f)
+                        col = get_orphan_color(lvl)
+                        if col:
+                            id_it.setForeground(col)
+                    self._set_obs_change_value(rr, '')
                 continue
+
             target = next((r for r in range(t.rowCount()) if not t.item(r,1) or not t.item(r,1).text().strip()), None)
             if target is None:
                 target = t.rowCount(); t.setRowCount(target+1); t._init_rows(target,target+1)
             t.setItem(target,1,QTableWidgetItem(part))
-            cb = QComboBox(); cb.addItem(lvl); cb.setCurrentText(lvl)
-            col = get_orphan_color(lvl)
-            if col: cb.setStyleSheet(f"QComboBox {{ color:{col.name()}; font-weight:bold; }}")
-            t.setCellWidget(target,2,cb)
+
+            # Keep Change column blank for Orphan Parent entries.
+            self._set_obs_change_value(target, '')
+
+            if id_orphan_col >= 0:
+                id_it = QTableWidgetItem(lvl)
+                _bold_f = id_it.font(); _bold_f.setBold(True); id_it.setFont(_bold_f)
+                col = get_orphan_color(lvl)
+                if col:
+                    id_it.setForeground(col)
+                t.setItem(target, id_orphan_col, id_it)
+
             replacement_text = '' if self.prompt_replacement_update_for_orphans else 'OBSOLETE: NO REPLACEMENT'
             t.setItem(target,3,QTableWidgetItem(replacement_text))
             existing.add(part)
@@ -7970,6 +8949,114 @@ class WURemovedBOMItemsTab(QWidget):
                 mapping[key] = (rep_it.text() if rep_it else '').strip()
         return mapping
 
+    def _get_orphan_label_start_level(self) -> int:
+        """Return the first orphan level to assign for the current analysis run.
+
+        In With / Without Replacement mode, continue numbering from the highest
+        value already present in OBS Parts -> Identified Orphans. In all other
+        modes, preserve the legacy behavior starting at Orphan1.
+        """
+        if not self.compare_with_replacement:
+            return 1
+        if not self.obs_provider or not hasattr(self.obs_provider, 'table'):
+            return 1
+
+        identified_col = self._find_obs_col('Identified Orphans')
+        if identified_col < 0:
+            return 1
+
+        max_level = 0
+        t = self.obs_provider.table
+        for r in range(t.rowCount()):
+            it = t.item(r, identified_col)
+            value = (it.text() if it else '').strip()
+            if not value:
+                continue
+            match = re.match(r'^orphan\s*(\d+)$', value, flags=re.IGNORECASE)
+            if not match:
+                continue
+            try:
+                max_level = max(max_level, int(match.group(1)))
+            except ValueError:
+                pass
+        return max_level + 1 if max_level > 0 else 1
+
+    def _build_orphan_blocks_from_wu(self) -> List[Dict[str, Any]]:
+        """Build independent orphan blocks from WU of Removed BOM Items.
+
+        Each block contains:
+        - parents: immediate parent part(s) at WU Level 1 in the same WU-0 block
+        - child: orphan part at WU Level 0
+        """
+        blocks: List[Dict[str, Any]] = []
+        pcol = self._find_col('Part')
+        ocol = self._find_col('Orphans List')
+        wucol = self._find_col('WU Level')
+        rcol = self._find_col('Replacement')
+        if pcol < 0 or ocol < 0 or wucol < 0:
+            return blocks
+
+        def is_zero(v):
+            return str(v).strip() in ('0', '0.0')
+
+        def is_one(v):
+            return str(v).strip() in ('1', '1.0')
+
+        # Keep aligned with the parent ignore rule used in orphan derivation.
+        ignore_prefixes = ('0243', '0299', '0289', '0290')
+
+        row_count = self.table.rowCount()
+        r = 0
+        while r < row_count:
+            wu = self.table.item(r, wucol).text() if self.table.item(r, wucol) else ''
+            if not is_zero(wu):
+                r += 1
+                continue
+
+            child_it = self.table.item(r, pcol)
+            orphan_it = self.table.item(r, ocol)
+            child_part = (child_it.text() if child_it else '').strip().upper()
+            orphan_label = (orphan_it.text() if orphan_it else '').strip().lower()
+
+            block_end = row_count
+            for i in range(r + 1, row_count):
+                nxt = self.table.item(i, wucol).text() if self.table.item(i, wucol) else ''
+                if is_zero(nxt):
+                    block_end = i
+                    break
+
+            if child_part and orphan_label.startswith('orphan'):
+                parent_list: List[str] = []
+                wu_replacements: Dict[str, str] = {}
+
+                if rcol >= 0:
+                    child_rep_it = self.table.item(r, rcol)
+                    child_rep = (child_rep_it.text() if child_rep_it else '').strip()
+                    if child_rep:
+                        wu_replacements[child_part] = child_rep
+
+                for i in range(r + 1, block_end):
+                    wu_p = self.table.item(i, wucol).text() if self.table.item(i, wucol) else ''
+                    if not is_one(wu_p):
+                        continue
+                    pit = self.table.item(i, pcol)
+                    parent_part = (pit.text().lstrip() if pit else '').strip().upper()
+                    if not parent_part or parent_part.startswith(ignore_prefixes):
+                        continue
+                    if parent_part != child_part and parent_part not in parent_list:
+                        parent_list.append(parent_part)
+                    if rcol >= 0 and parent_part:
+                        parent_rep_it = self.table.item(i, rcol)
+                        parent_rep = (parent_rep_it.text() if parent_rep_it else '').strip()
+                        if parent_rep and parent_part not in wu_replacements:
+                            wu_replacements[parent_part] = parent_rep
+                if parent_list:
+                    blocks.append({'parents': parent_list, 'child': child_part, 'wu_replacements': wu_replacements})
+
+            r = block_end
+
+        return blocks
+
     def perform_orphan_analysis(self):
         # Applicable only for With / Without Replacement mode.
         if self.compare_with_replacement:
@@ -8017,7 +9104,10 @@ class WURemovedBOMItemsTab(QWidget):
             if key in obs_map:
                 self.table.setItem(r, ocol, QTableWidgetItem(obs_map[key]))
 
-        # Step 1: Orphan1
+        start_level = self._get_orphan_label_start_level()
+        first_orphan_label = f'Orphan{start_level}'
+
+        # Step 1: first orphan level for this run
         orphan_parts = set()
         r = 0
         while r < row_count:
@@ -8065,23 +9155,23 @@ class WURemovedBOMItemsTab(QWidget):
                         mark = True
 
                 if mark and part:
-                    self.table.setItem(child_row, ocol, QTableWidgetItem('Orphan1'))
+                    self.table.setItem(child_row, ocol, QTableWidgetItem(first_orphan_label))
                     orphan_parts.add(part.upper())
 
                 r = block_end
             else:
                 r += 1
 
-        # Propagate Orphan1
+        # Propagate first orphan level for this run
         for r in range(row_count):
             it = self.table.item(r, pcol)
             if it and it.text().strip().upper() in orphan_parts:
                 oit = self.table.item(r, ocol)
                 if not oit or not oit.text().strip():
-                    self.table.setItem(r, ocol, QTableWidgetItem('Orphan1'))
+                    self.table.setItem(r, ocol, QTableWidgetItem(first_orphan_label))
 
-        # Step 2+: Orphan2, Orphan3...
-        current_level = 2
+        # Step 2+: continue numbering after the first orphan level for this run
+        current_level = start_level + 1
         while True:
             new_found = False
             new_parts = set()
@@ -8144,18 +9234,25 @@ class WURemovedBOMItemsTab(QWidget):
         # Must run after all Orphan detection logic is fully complete.
         # Does NOT overwrite any cell in the Orphans List column that already
         # has a value.
+        def _as_wu_int(_val) -> int | None:
+            """Parse WU level values like 2, 2.0, '2', '2.0' safely."""
+            _txt = str(_val).strip()
+            if not _txt:
+                return None
+            try:
+                return int(float(_txt))
+            except (ValueError, TypeError):
+                return None
+
         _max_wu_in_data = 0
         for _r in range(row_count):
             _wu_it = self.table.item(_r, wucol)
             if _wu_it:
-                try:
-                    _v = int(_wu_it.text().strip())
-                    if _v > _max_wu_in_data:
-                        _max_wu_in_data = _v
-                except (ValueError, TypeError):
-                    pass
+                _v = _as_wu_int(_wu_it.text())
+                if _v is not None and _v > _max_wu_in_data:
+                    _max_wu_in_data = _v
 
-        if _max_wu_in_data > 1 or self.compare_with_replacement:
+        if _max_wu_in_data > 1:
             # Part-number prefixes whose presence on the immediate parent row
             # exempts the evaluated row from being flagged as Orphan Parent:
             #   Option prefixes, Option Class prefixes, Commodity Codes 0288/0289/0243/0290
@@ -8190,9 +9287,8 @@ class WURemovedBOMItemsTab(QWidget):
                         _wu_row_it = self.table.item(_i, wucol)
                         if not _wu_row_it:
                             continue
-                        try:
-                            _wu_int = int(_wu_row_it.text().strip())
-                        except (ValueError, TypeError):
+                        _wu_int = _as_wu_int(_wu_row_it.text())
+                        if _wu_int is None:
                             continue
 
                         # Condition 1: WU Level must be > 1
@@ -8214,40 +9310,56 @@ class WURemovedBOMItemsTab(QWidget):
                         if _oit and _oit.text().strip():
                             continue
 
-                        # Condition 4: mark as Orphan Parent only when there is no
-                        # immediate next-level child (WU Level = current + 1) under
-                        # this row's branch. Level can vary and this remains dynamic.
-                        _has_next_level_child = False
-                        _child_wu_target = _wu_int + 1
-                        for _j in range(_i + 1, _block_end):
-                            _cj_wu_it = self.table.item(_j, wucol)
-                            if not _cj_wu_it:
+                        # Find the immediate parent row: nearest preceding row in this
+                        # block whose WU Level equals (_wu_int - 1)
+                        _parent_wu_target = _wu_int - 1
+                        _parent_row = -1
+                        for _j in range(_i - 1, _block_start, -1):
+                            _pj_wu_it = self.table.item(_j, wucol)
+                            if not _pj_wu_it:
                                 continue
-                            try:
-                                _cj_wu = int(_cj_wu_it.text().strip())
-                            except (ValueError, TypeError):
+                            _pj_wu = _as_wu_int(_pj_wu_it.text())
+                            if _pj_wu is None:
                                 continue
-
-                            # Branch ended for this row.
-                            if _cj_wu <= _wu_int:
+                            if _pj_wu == _parent_wu_target:
+                                _parent_row = _j
+                                break
+                            elif _pj_wu < _parent_wu_target:
+                                # Hierarchy went below the expected level; stop
                                 break
 
-                            # Found at least one direct reporting child.
-                            if _cj_wu == _child_wu_target:
-                                _has_next_level_child = True
-                                break
-
-                        # If part reports to any next-level row, it is NOT orphan parent.
-                        if _has_next_level_child:
+                        # Skip if no clear immediate parent found (conservative)
+                        if _parent_row < 0:
                             continue
 
-                        # No next-level reporting row found in this branch.
+                        # Condition 2: parent must NOT be an Option / Option Class /
+                        # Commodity Code (0288, 0289, 0243, 0290)
+                        _parent_part_it = self.table.item(_parent_row, pcol)
+                        _parent_part = (_parent_part_it.text().lstrip()
+                                        if _parent_part_it else '')
+                        if _parent_part.strip().startswith(_orphan_parent_exempt_prefixes):
+                            # Parent is an exempt type -> not an Orphan Parent
+                            continue
+
+                        # All conditions satisfied -> mark as Orphan Parent
                         self.table.setItem(_i, ocol, QTableWidgetItem('Orphan Parent'))
 
                     _r = _block_end
                 else:
                     _r += 1
         # ── End Orphan Parent detection ──────────────────────────────────────
+
+        # Build/update Orphan Hierarchy view in OBS Parts after each run.
+        if self.obs_provider and hasattr(self.obs_provider, 'update_orphan_hierarchy_view'):
+            _hier_blocks = self._build_orphan_blocks_from_wu()
+            _wu_repl_lookup: Dict[str, str] = {}
+            for _b in _hier_blocks:
+                for _k, _v in (_b.get('wu_replacements', {}) or {}).items():
+                    _kk = (_k or '').strip().upper()
+                    _vv = (_v or '').strip()
+                    if _kk and _vv and _kk not in _wu_repl_lookup:
+                        _wu_repl_lookup[_kk] = _vv
+            self.obs_provider.update_orphan_hierarchy_view(_hier_blocks, _wu_repl_lookup)
 
         from PyQt6.QtGui import QColor
         for r in range(self.table.rowCount()):
@@ -8417,6 +9529,8 @@ class LimitedTextEdit(QTextEdit):
         self.textChanged.connect(self._limit)
 
     def _limit(self):
+        if self.limit is None:
+            return
         text = self.toPlainText()
         if len(text) > self.limit:
             self.blockSignals(True)
@@ -8836,6 +9950,21 @@ class ECCreationInputsFormTab(QWidget):
         self.cb_obs_parts.stateChanged.connect(self.refresh_selected_tab_payload)
         self.cb_structure_sheet.stateChanged.connect(self.refresh_selected_tab_payload)
 
+        # Keep Include-Data checkboxes aligned with source-tab data availability.
+        self._include_tabs_sync_timer = QTimer(self)
+        self._include_tabs_sync_timer.setInterval(1200)
+        self._include_tabs_sync_timer.timeout.connect(self._update_include_tab_checkbox_enablement)
+        self._include_tabs_sync_timer.start()
+        QTimer.singleShot(0, self._update_include_tab_checkbox_enablement)
+
+        self.btn_change_summary = QPushButton("Change Summary")
+        self.btn_change_summary.setFixedHeight(26)
+        self.btn_change_summary.setToolTip(
+            "Generate row-wise change summary from Structure Sheet and optionally export"
+        )
+        self.btn_change_summary.clicked.connect(self.on_change_summary_clicked)
+        section_b_right.addWidget(self.btn_change_summary)
+
         section_b_right.addStretch(1)
        
         # Short Title
@@ -8870,7 +9999,7 @@ class ECCreationInputsFormTab(QWidget):
 
         section_b_left.addLayout(ps_row)
 
-        self.problem_txt = LimitedTextEdit(2000)
+        self.problem_txt = LimitedTextEdit(None)
         self.problem_txt.setMinimumHeight(260)
         self.problem_txt.setMaximumWidth(900)
         section_b_left.addWidget(self.problem_txt)
@@ -8896,7 +10025,7 @@ class ECCreationInputsFormTab(QWidget):
 
         section_b_left.addLayout(sol_row)
 
-        self.solution_txt = LimitedTextEdit(2000)
+        self.solution_txt = LimitedTextEdit(None)
         self.solution_txt.setMinimumHeight(260)
         self.solution_txt.setMaximumWidth(900)
 
@@ -8909,6 +10038,7 @@ class ECCreationInputsFormTab(QWidget):
 
 
     def refresh_selected_tab_payload(self):
+        self._update_include_tab_checkbox_enablement()
         main = self.window()
         payload = {}
 
@@ -8942,6 +10072,151 @@ class ECCreationInputsFormTab(QWidget):
                 payload["Structure Sheet"] = structure_data
 
         self.selected_tab_payload = payload
+
+    def _find_table_col_index(self, table, header_names: List[str]) -> int:
+        if table is None:
+            return -1
+
+        targets = {' '.join((h or '').strip().lower().split()) for h in header_names}
+        for c in range(table.columnCount()):
+            h = table.horizontalHeaderItem(c)
+            if not h:
+                continue
+            nh = ' '.join((h.text() or '').strip().lower().split())
+            if nh in targets:
+                return c
+        return -1
+
+    def _table_has_nonempty_col_value(self, table, col_index: int) -> bool:
+        if table is None or col_index < 0:
+            return False
+        for r in range(table.rowCount()):
+            it = table.item(r, col_index)
+            txt = (it.text() if it else '') or ''
+            if txt.strip():
+                return True
+        return False
+
+    def _has_where_used_data(self) -> bool:
+        main = self.window()
+        whereused_tab = getattr(main, 'whereused_tab', None)
+        table = getattr(whereused_tab, 'table', None) if whereused_tab else None
+        part_col = self._find_table_col_index(table, ['Part'])
+        return self._table_has_nonempty_col_value(table, part_col)
+
+    def _has_obs_parts_data(self) -> bool:
+        main = self.window()
+        obs_tab = getattr(main, 'obs_tab', None)
+        table = getattr(obs_tab, 'table', None) if obs_tab else None
+        obs_col = self._find_table_col_index(table, ['OBS Parts', 'OBS Part', 'Part'])
+        return self._table_has_nonempty_col_value(table, obs_col)
+
+    def _has_structure_sheet_data(self) -> bool:
+        main = self.window()
+        structure_tab = getattr(main, 'structure_tab', None)
+        table = getattr(structure_tab, 'table', None) if structure_tab else None
+        part_col = self._find_table_col_index(table, ['Part'])
+        return self._table_has_nonempty_col_value(table, part_col)
+
+    def _set_checkbox_enabled_by_data(self, checkbox: QCheckBox, has_data: bool):
+        checkbox.blockSignals(True)
+        try:
+            checkbox.setEnabled(has_data)
+            if not has_data:
+                checkbox.setChecked(False)
+        finally:
+            checkbox.blockSignals(False)
+
+    def _update_include_tab_checkbox_enablement(self):
+        self._set_checkbox_enabled_by_data(self.cb_where_used, self._has_where_used_data())
+        self._set_checkbox_enabled_by_data(self.cb_obs_parts, self._has_obs_parts_data())
+        self._set_checkbox_enabled_by_data(self.cb_structure_sheet, self._has_structure_sheet_data())
+
+    def _collect_obs_parts_for_summary(self) -> Dict[str, List[str]]:
+        """Return grouped OBS summary lines by 4 requested cases."""
+        main = self.window()
+        obs_tab = getattr(main, 'obs_tab', None)
+        table = getattr(obs_tab, 'table', None) if obs_tab else None
+        if table is None:
+            return {
+                'obsolete_with_repl': [],
+                'obsolete_without_repl': [],
+                'inactivate_with_repl': [],
+                'inactivate_without_repl': [],
+            }
+
+        obs_col = self._find_table_col_index(table, ['OBS Parts', 'OBS Part', 'Part'])
+        change_col = self._find_table_col_index(table, ['Change'])
+        repl_col = self._find_table_col_index(table, ['Replacement'])
+
+        grouped = {
+            'obsolete_with_repl': [],
+            'obsolete_without_repl': [],
+            'inactivate_with_repl': [],
+            'inactivate_without_repl': [],
+        }
+
+        if obs_col < 0:
+            return grouped
+
+        for r in range(table.rowCount()):
+            obs_it = table.item(r, obs_col)
+            obs_part = ((obs_it.text() if obs_it else '') or '').strip()
+            if not obs_part:
+                continue
+
+            change_txt = 'Obsolete'
+            if change_col >= 0:
+                w = table.cellWidget(r, change_col)
+                if isinstance(w, QComboBox):
+                    change_txt = (w.currentText() or '').strip() or 'Obsolete'
+                else:
+                    ch_it = table.item(r, change_col)
+                    change_txt = ((ch_it.text() if ch_it else '') or '').strip() or 'Obsolete'
+
+            repl_txt = ''
+            if repl_col >= 0:
+                repl_it = table.item(r, repl_col)
+                repl_txt = ((repl_it.text() if repl_it else '') or '').strip()
+
+            has_repl = bool(repl_txt) and ('no replacement' not in repl_txt.lower())
+            is_inactivate = change_txt.strip().lower().startswith('inactivate')
+
+            if is_inactivate and has_repl:
+                grouped['inactivate_with_repl'].append(f"{obs_part} with {repl_txt}")
+            elif is_inactivate and not has_repl:
+                grouped['inactivate_without_repl'].append(obs_part)
+            elif (not is_inactivate) and has_repl:
+                grouped['obsolete_with_repl'].append(f"{obs_part} with {repl_txt}")
+            else:
+                grouped['obsolete_without_repl'].append(obs_part)
+
+        return grouped
+
+    def _build_obs_parts_summary_lines(self) -> List[str]:
+        grouped = self._collect_obs_parts_for_summary()
+        total = sum(len(v) for v in grouped.values())
+        if total == 0:
+            return []
+
+        lines = ['Disabled Parts List from SmBOM:', '']
+
+        def _append_case(title: str, items: List[str]):
+            if not items:
+                return
+            lines.append(title)
+            for it in items:
+                lines.append(f"     {it}")
+            lines.append('')
+
+        _append_case('Obsolete below parts with replacement:', grouped['obsolete_with_repl'])
+        _append_case('Obsolete below parts without replacement:', grouped['obsolete_without_repl'])
+        _append_case('Inactivate below parts with replacement:', grouped['inactivate_with_repl'])
+        _append_case('Inactivate below parts without replacement:', grouped['inactivate_without_repl'])
+
+        while lines and lines[-1] == '':
+            lines.pop()
+        return lines
 
     def get_selected_tab_payload(self):
         self.refresh_selected_tab_payload()
@@ -8982,12 +10257,211 @@ class ECCreationInputsFormTab(QWidget):
 
                 if value:
                     has_value = True
-                row_data[header] = value
+                # Preserve values when duplicate header captions exist in the table.
+                # This is important for selector columns (Yes/No) that may share a
+                # caption with a later data column.
+                if header in row_data:
+                    existing = (row_data.get(header, '') or '').strip().lower()
+                    incoming = (value or '').strip().lower()
+
+                    # Keep checkbox state if already captured and later duplicate is blank.
+                    if existing in {'yes', 'no'} and incoming == '':
+                        continue
+
+                    # Keep first non-empty value when later duplicate is blank.
+                    if row_data.get(header, '') and not value:
+                        continue
+
+                    # Store duplicate under a unique key so no data is lost.
+                    dup_idx = 2
+                    dup_key = f"{header} ({dup_idx})"
+                    while dup_key in row_data:
+                        dup_idx += 1
+                        dup_key = f"{header} ({dup_idx})"
+                    row_data[dup_key] = value
+                else:
+                    row_data[header] = value
 
             if has_value:
                 rows.append(row_data)
 
         return rows
+
+    def on_change_summary_clicked(self):
+        self._update_include_tab_checkbox_enablement()
+
+        if not (
+            self.cb_where_used.isChecked()
+            or self.cb_obs_parts.isChecked()
+            or self.cb_structure_sheet.isChecked()
+        ):
+            QMessageBox.information(
+                self,
+                'Change Summary',
+                'Update the Where used, OBS Parts and Structure Sheet tabs and select thecheck boxes and re-run.',
+            )
+            return
+
+        # Prompt for OBS inclusion if data exists but checkbox is not selected.
+        if self._has_obs_parts_data() and not self.cb_obs_parts.isChecked() and self.cb_obs_parts.isEnabled():
+            reply = QMessageBox.question(
+                self,
+                'Include OBS Parts',
+                'OBS Parts data is available but not selected.\n\n'
+                'Do you want to include OBS Parts in the Change Summary (PSS)?',
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                self.cb_obs_parts.setChecked(True)
+
+        if generate_change_summary_sentences is None:
+            QMessageBox.warning(
+                self,
+                'Change Summary',
+                'PSS_Change_Summary.py is not available. Please ensure the file exists.',
+            )
+            return
+
+        sentences = []
+        if self.cb_structure_sheet.isChecked():
+            main = self.window()
+            structure_tab = getattr(main, 'structure_tab', None)
+            structure_table = getattr(structure_tab, 'table', None) if structure_tab else None
+            if structure_table is None:
+                QMessageBox.information(
+                    self,
+                    'Change Summary',
+                    'Structure Sheet tab is not available yet.',
+                )
+                return
+
+            structure_rows = self._table_to_rows(structure_table)
+            if not structure_rows:
+                QMessageBox.information(
+                    self,
+                    'Change Summary',
+                    'Structure Sheet has no data. Please add/import data first.',
+                )
+                return
+
+            # Validate Remove Item rows before generating summary.
+            def _norm_local(text: str) -> str:
+                return ''.join(ch for ch in (text or '').strip().lower() if ch.isalnum())
+
+            invalid_by_parent = {}
+            current_parent = ''
+            for row in structure_rows:
+                action_val = ''
+                repl_val = ''
+                part_val = ''
+                bom_val = ''
+                for k, v in row.items():
+                    nk = _norm_local(k)
+                    if nk in {'action', 'changetype'}:
+                        action_val = (str(v) if v is not None else '').strip()
+                    elif nk == 'replacement':
+                        repl_val = (str(v) if v is not None else '').strip()
+                    elif nk == 'part':
+                        part_val = (str(v) if v is not None else '').strip()
+                    elif nk in {'bomlevel', 'wulevel', 'level'}:
+                        bom_val = (str(v) if v is not None else '').strip()
+
+                try:
+                    bom_int = int(float(bom_val)) if bom_val != '' else -1
+                except Exception:
+                    bom_int = -1
+
+                if bom_int == 0 and part_val:
+                    current_parent = part_val
+
+                if _norm_local(action_val).startswith('removeitem') and repl_val:
+                    parent_key = current_parent or '(unknown parent)'
+                    child_key = part_val or '(blank)'
+                    invalid_by_parent.setdefault(parent_key, [])
+                    if child_key not in invalid_by_parent[parent_key]:
+                        invalid_by_parent[parent_key].append(child_key)
+
+            if invalid_by_parent:
+                parents = list(invalid_by_parent.keys())
+
+                grouped_lines = []
+                for p in parents[:6]:
+                    items = invalid_by_parent.get(p, [])
+                    item_preview = ', '.join(items[:12])
+                    item_more = '' if len(items) <= 12 else f' and {len(items) - 12} more'
+                    grouped_lines.append(f'Affected Parent: {p}\nAffected BOM Items: {item_preview}{item_more}')
+
+                if len(parents) > 6:
+                    grouped_lines.append(f'...and {len(parents) - 6} more parent group(s).')
+
+                QMessageBox.warning(
+                    self,
+                    'Change Summary Validation',
+                    'Remove replacement part numbers for items marked as "Remove Item" and re-run.'
+                    + "\n\n"
+                    + '\n\n'.join(grouped_lines),
+                )
+                return
+
+            try:
+                sentences = generate_change_summary_sentences(structure_rows)
+            except Exception as e:
+                QMessageBox.warning(self, 'Change Summary Error', str(e))
+                return
+
+            if not sentences:
+                QMessageBox.information(
+                    self,
+                    'Change Summary',
+                    'No change-summary lines could be generated from the current Structure Sheet rows.',
+                )
+                return
+
+        # Build required output block and append it inside Proposed Solution.
+        block_lines = ['Change Summary:-'] + sentences
+        obs_lines = []
+        if self.cb_obs_parts.isChecked():
+            obs_lines = self._build_obs_parts_summary_lines()
+            if obs_lines:
+                block_lines += ['', ''] + obs_lines
+        if not sentences and not obs_lines:
+            QMessageBox.information(
+                self,
+                'Change Summary',
+                'No change-summary content available for the selected tabs.',
+            )
+            return
+        import html as _html
+
+        def _line_to_html(line: str) -> str:
+            raw = line or ''
+            # Preserve left indentation visually in rich text.
+            lead_spaces = len(raw) - len(raw.lstrip(' '))
+            prefix = '&nbsp;' * lead_spaces
+
+            body = raw.lstrip(' ')
+            # Support markdown and plain-token forms for From/To in change-summary lines.
+            body = re.sub(r"\*\*(from\s*:?)\*\*", r"<b>\1</b>", body, flags=re.IGNORECASE)
+            body = re.sub(r"\*\*(to\s*:?)\*\*", r"<b>\1</b>", body, flags=re.IGNORECASE)
+            body = re.sub(r"(?<!\w)(from\s*:)(?!\w)", r"<b>\1</b>", body, flags=re.IGNORECASE)
+            body = re.sub(r"(?<!\w)(to\s*:)(?!\w)", r"<b>\1</b>", body, flags=re.IGNORECASE)
+
+            # Escape first, then allow intended <b> tags from generator and local transforms.
+            escaped = _html.escape(body)
+            escaped = escaped.replace('&lt;b&gt;', '<b>').replace('&lt;/b&gt;', '</b>')
+            return prefix + escaped
+
+        block_html = '<br>'.join(_line_to_html(ln) for ln in block_lines)
+
+        existing_text = self.solution_txt.toPlainText().strip()
+        if existing_text:
+            self.solution_txt.insertHtml('<br><br><br>')
+        self.solution_txt.insertHtml(block_html)
+
+        for line in sentences:
+            print(line)
+        return
 # ...existing code...
 
     def _selected_radio_text(self, key: str) -> str:
@@ -11245,6 +12719,8 @@ class MainWindow(QMainWindow):
         self._tab_switch_guard = False
         self._prev_tab_index = self.tabs.currentIndex()
         self.tabs.currentChanged.connect(self._on_main_tab_changed)
+        self._structure_attention_signals_connected = False
+        self._connect_structure_tab_attention_signals()
 
         self._find_last_query = ''
         self._find_hits = []
@@ -11339,6 +12815,54 @@ class MainWindow(QMainWindow):
         reset_btn.setGraphicsEffect(shadow); reset_btn.clicked.connect(self.reset_app); tb.addWidget(reset_btn)
 
         self.load_data_if_exists()
+        self._refresh_structure_tab_attention()
+
+    def _connect_structure_tab_attention_signals(self):
+        if getattr(self, '_structure_attention_signals_connected', False):
+            return
+        if self.structure_tab is None:
+            return
+        table = getattr(self.structure_tab, 'table', None)
+        if table is None:
+            return
+
+        self._structure_attention_signals_connected = True
+        table.itemChanged.connect(self._refresh_structure_tab_attention)
+
+        model = table.model()
+        if model is not None:
+            model.dataChanged.connect(self._refresh_structure_tab_attention)
+            model.rowsInserted.connect(self._refresh_structure_tab_attention)
+            model.rowsRemoved.connect(self._refresh_structure_tab_attention)
+            model.columnsInserted.connect(self._refresh_structure_tab_attention)
+            model.columnsRemoved.connect(self._refresh_structure_tab_attention)
+
+    def _structure_tab_has_incomplete_details(self) -> bool:
+        tab = self.structure_tab
+        if tab is None or not hasattr(tab, '_collect_incomplete_actions'):
+            return False
+        try:
+            summary = tab._collect_incomplete_actions()
+            return int(summary.get('incomplete_total', 0)) > 0
+        except Exception:
+            return False
+
+    def _refresh_structure_tab_attention(self, *_args):
+        tab = self.structure_tab
+        if tab is None:
+            return
+        idx = self.tabs.indexOf(tab)
+        if idx < 0:
+            return
+
+        if self._structure_tab_has_incomplete_details():
+            self.tabs.tabBar().setTabTextColor(idx, QColor('#E6A23C'))
+            return
+
+        if self.tabs.currentIndex() == idx:
+            self.tabs.tabBar().setTabTextColor(idx, QColor('#0F2D46'))
+        else:
+            self.tabs.tabBar().setTabTextColor(idx, QColor('#1F3B57'))
 
     def _initialize_ec_category_tab_management(self):
         for tab_name, tab_widget in self._managed_tabs.items():
@@ -11458,23 +12982,19 @@ class MainWindow(QMainWindow):
         prev = getattr(self, '_prev_tab_index', -1)
         if prev < 0 or prev == new_index:
             self._prev_tab_index = new_index
+            self._refresh_structure_tab_attention()
             return
 
         prev_widget = self.tabs.widget(prev)
         if isinstance(prev_widget, StructureSheetTab):
-            if not prev_widget.confirm_leave_with_incomplete():
-                self._tab_switch_guard = True
-                try:
-                    self.tabs.setCurrentIndex(prev)
-                finally:
-                    self._tab_switch_guard = False
-                return
+            self._refresh_structure_tab_attention()
 
         new_widget = self.tabs.widget(new_index)
         if isinstance(new_widget, StructureSheetTab) and hasattr(new_widget, '_reapply_action_visibility_all_rows'):
             new_widget._reapply_action_visibility_all_rows()
 
         self._prev_tab_index = new_index
+        self._refresh_structure_tab_attention()
 
     def aggregate_data(self)->Dict[str,Any]:
         payload = {'obs_parts': self.obs_tab.to_dict()}
@@ -11604,7 +13124,7 @@ class OrphanAnalysisTab(QWidget):
         outer.addWidget(self.lbl_without_replacement_note)
 
         self.lbl_with_replacement_note = QLabel(
-            "Export WU to multiple level only if Orphan Parents to be identified."
+            "Note: Export WU to multiple level only if Orphan Parents to be identified."
         )
         self.lbl_with_replacement_note.setWordWrap(True)
         self.lbl_with_replacement_note.setStyleSheet("color:#C1272D; font-size:11px;")
