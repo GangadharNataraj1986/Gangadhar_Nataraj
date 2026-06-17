@@ -280,43 +280,56 @@ def fetch_inventory_demand_mapping(parts: Iterable[str]) -> list[dict[str, Any]]
             "pyodbc is not installed. Install it with: pip install pyodbc"
         ) from exc
 
-    # Remove special characters from parts for the SQL filter (same way as dpart is normalized in the table)
+    # Remove special characters from parts for resilient SQL matching.
     import re
     normalized_parts = [re.sub(r'[^A-Za-z0-9]', '', p) for p in cleaned_parts]
     part_filter = ", ".join(f"'{p}'" for p in normalized_parts)
 
-    # Query factknxssplyconsmp for demand order details
+    # Inventory-demand mapping sourced from costed BOM with BOM freeze and ECO anchor dates.
+    # Uses certified_system_summary for BOM freeze dates and latest ECO anchor from slot_change_summary_rr.
     sql = f"""
-SELECT
-    TRIM(UPPER(CAST(dpart AS STRING)))                               AS part_number,
-    COALESCE(
-        NULLIF(TRIM(CAST(dorderid AS STRING)), ''),
-        NULLIF(TRIM(CAST(slotnum AS STRING)), ''),
-        NULLIF(TRIM(CAST(sordid AS STRING)), ''),
-        NULLIF(TRIM(CAST(indpndntdmndordid AS STRING)), ''),
-        NULLIF(TRIM(CAST(pegpartname AS STRING)), ''),
-        ''
-    )                                                                 AS system_number,
-    CAST(COALESCE(dqty, 0) AS DECIMAL(18, 3))                        AS consumption_qty,
-    ''                                                                AS parent_part,
-    0                                                                 AS bom_level,
-    ''                                                                AS platform,
-    ''                                                                AS config,
-    ''                                                                AS build_quarter,
-    ''                                                                AS socp_planned,
-    ''                                                                AS socp_actual,
-    ''                                                                AS bom_freeze_planned,
-    ''                                                                AS bpm_freeze_actual,
-    CAST(sstartdate AS STRING)                                        AS sop_date,
-    CAST(sduedate AS STRING)                                          AS eop_date,
-    ''                                                                AS opportunity_no,
-    ''                                                                AS sales_order,
-    ''                                                                AS customer,
-    CAST(sduedate AS STRING)                                          AS actual_ship_date,
-    CAST(sduedate AS STRING)                                          AS planned_ship_date
-FROM prd.pd_mm.factknxssplyconsmp
-WHERE UPPER(REGEXP_REPLACE(CAST(dpart AS STRING), '[^A-Za-z0-9]', '')) IN ({part_filter})
-ORDER BY part_number, system_number
+SELECT DISTINCT
+    b.slotnum               AS system_slot_number,
+    b.slotnum               AS system_number,
+    b.matrlnum              AS part_number,
+    b.matrldesc             AS part_description,
+    b.parentpart            AS parent_part,
+    b.bomlvl                AS bom_level,
+    b.cmpntqty              AS consumption_qty,
+    b.platform,
+    b.buildqtr              AS build_quarter,
+    b.SOPDate               AS sop_date,
+    m.eopplanneddate        AS eop_planned_date,
+    m.eopplanneddate        AS eop_date,
+    css.bom_freeze_plan_date AS bom_freeze_planned,
+    css.bom_freeze_actual_date AS bom_freeze_actual,
+    scsr.eco_anchor_date_new AS eco_anchor_date,
+    b.oppno                 AS opportunity_no,
+    b.bomsalesdoc           AS sales_order,
+    b.custnamemd            AS customer
+FROM prd.pd_mm.summcostedbom b
+LEFT JOIN prd.pd_mm.factprojmilestncmncol m
+    ON b.slotnum = m.slotnum
+LEFT JOIN prd.pd_tw.certified_system_summary css
+    ON b.slotnum = css.system
+LEFT JOIN (
+    SELECT 
+        slot_number,
+        eco_anchor_date_new,
+        ROW_NUMBER() OVER (
+            PARTITION BY slot_number 
+            ORDER BY change_date DESC
+        ) AS rn
+    FROM prd.rd_kinaxis.slot_change_summary_rr
+) scsr
+    ON b.slotnum = scsr.slot_number 
+   AND scsr.rn = 1
+WHERE UPPER(REGEXP_REPLACE(CAST(b.matrlnum AS STRING), '[^A-Za-z0-9]', '')) IN ({part_filter})
+  AND CAST(b.SOPDate AS DATE) >= CURRENT_DATE
+ORDER BY 
+    part_number,
+    build_quarter,
+    system_slot_number
 """.strip()
 
     conn = pyodbc.connect(f"DSN={_DSN}", autocommit=True)
@@ -340,7 +353,7 @@ def fetch_open_purchase_order_details(
     parts: Iterable[str],
     plants: Sequence[str] | None = None,
 ) -> list[dict[str, Any]]:
-    """Return open PO detail rows for the requested part/plant combinations."""
+    """Return open PO detail rows for the requested part/plant combinations using star schema tables."""
     cleaned_parts = _clean_parts(parts)
     cleaned_plants = _clean_plants(plants)
     if not cleaned_parts:
@@ -353,31 +366,114 @@ def fetch_open_purchase_order_details(
             "pyodbc is not installed. Install it with: pip install pyodbc"
         ) from exc
 
-    part_filter = ", ".join(f"'{part}'" for part in cleaned_parts)
+    normalized_parts = sorted({part.replace('-', '') for part in cleaned_parts if part})
+    part_filter = ", ".join(f"'{part}'" for part in normalized_parts)
     plant_filter = ", ".join(f"'{plant}'" for plant in cleaned_plants)
+    
+    # Use star schema tables: factposl (line items) + factpol (PO headers)
     sql = f"""
+WITH open_po_obs AS (
+    SELECT
+        fp.materialnum AS part_number,
+        fp.plantcd AS plant,
+        fp.pocd AS po_number,
+        fp.polcd AS po_line_number,
+        CAST(COALESCE(fp.dueqty, 0) AS DECIMAL(18, 3)) AS po_quantity,
+        CAST(
+            CASE
+                WHEN COALESCE(fp.dueqty, 0) >= COALESCE(fp.openqty, 0)
+                THEN COALESCE(fp.dueqty, 0) - COALESCE(fp.openqty, 0)
+                ELSE 0
+            END AS DECIMAL(18, 3)
+        ) AS gr_quantity,
+        CAST(COALESCE(fp.openqty, 0) AS DECIMAL(18, 3)) AS open_qty,
+        COALESCE(pol.vndr_name, '') AS supplier_name,
+        COALESCE(pol.pg_code, '') AS buyer_code,
+        TRY_CAST(pol.po_date AS DATE) AS po_creation_date,
+        -- Use commitment date (original or current)
+        CASE
+            WHEN fp.orgnlcmmitdate != '1900-01-01' AND TRY_CAST(fp.orgnlcmmitdate AS DATE) IS NOT NULL 
+            THEN TRY_CAST(fp.orgnlcmmitdate AS DATE)
+            WHEN fp.cmmitdate != '1900-01-01' AND TRY_CAST(fp.cmmitdate AS DATE) IS NOT NULL 
+            THEN TRY_CAST(fp.cmmitdate AS DATE)
+            WHEN fp.needbydate != '1900-01-01' AND TRY_CAST(fp.needbydate AS DATE) IS NOT NULL 
+            THEN TRY_CAST(fp.needbydate AS DATE)
+            ELSE NULL
+        END AS delivery_date,
+        TRY_CAST(fp.needbydate AS DATE) AS need_by_date,
+        -- PACE/DASH classification
+        CASE
+            WHEN UPPER(COALESCE(mm.mrpprfl, '')) LIKE 'SGP%' THEN 'PACE'
+            WHEN UPPER(COALESCE(mm.mrpprfl, '')) LIKE 'GDS%' THEN 'DASH'
+            ELSE ''
+        END AS pace_dash,
+        ROW_NUMBER() OVER (
+            PARTITION BY fp.materialnum
+            ORDER BY
+                -- Only OPEN POs
+                CASE WHEN pol.status = 'OPEN' THEN 0 ELSE 1 END ASC,
+                -- Plant priority
+                CASE
+                    WHEN fp.plantcd IN ('4060','4070','4080','4090') THEN 0
+                    WHEN fp.plantcd IN ('4020','4030','4055') THEN 1
+                    ELSE 2
+                END ASC,
+                -- Closest relevant date
+                CASE
+                    WHEN fp.orgnlcmmitdate != '1900-01-01' AND TRY_CAST(fp.orgnlcmmitdate AS DATE) IS NOT NULL 
+                    THEN ABS(DATEDIFF(DAY, CAST(GETDATE() AS DATE), TRY_CAST(fp.orgnlcmmitdate AS DATE)))
+                    WHEN fp.cmmitdate != '1900-01-01' AND TRY_CAST(fp.cmmitdate AS DATE) IS NOT NULL 
+                    THEN ABS(DATEDIFF(DAY, CAST(GETDATE() AS DATE), TRY_CAST(fp.cmmitdate AS DATE)))
+                    WHEN fp.needbydate != '1900-01-01' AND TRY_CAST(fp.needbydate AS DATE) IS NOT NULL 
+                    THEN ABS(DATEDIFF(DAY, CAST(GETDATE() AS DATE), TRY_CAST(fp.needbydate AS DATE)))
+                    ELSE 999999
+                END ASC
+        ) AS rn
+    FROM prd.pd_mm.factposl fp
+    INNER JOIN prd.pd_mm.factpol pol
+        ON pol.pocd = fp.pocd
+        AND pol.rflg = 1
+    LEFT JOIN prd.pd_mm.factplantmaterial mm
+        ON mm.materialnum = fp.materialnum
+        AND mm.plantcd = fp.plantcd
+        AND mm.rflg = 1
+    WHERE REPLACE(TRIM(CAST(fp.materialnum AS STRING)), '-', '') IN ({part_filter})
+        AND CAST(fp.plantcd AS STRING) IN ({plant_filter})
+        AND fp.rflg = 1
+        AND UPPER(COALESCE(pol.status, '')) LIKE 'OPEN%'
+        AND COALESCE(fp.openqty, 0) > 0
+)
 SELECT
-    material_number AS part_number,
-    plant_code AS plant,
-    purchase_order_number AS po_number,
-    purchase_order_line_number AS po_line_number,
-    CAST(COALESCE(quantity, 0) - COALESCE(quantity_of_goods_received, 0) AS DECIMAL(18, 3)) AS open_qty,
-    COALESCE(vendor_name, '') AS supplier_name,
-    COALESCE(purchase_group_code, '') AS buyer_name,
-    item_delivery_date AS delivery_date
-FROM prd.ud_agsocebi.open_purchase_order
-WHERE material_number IN ({part_filter})
-  AND plant_code IN ({plant_filter})
-  AND (COALESCE(quantity, 0) - COALESCE(quantity_of_goods_received, 0)) > 0
-ORDER BY material_number, plant_code, item_delivery_date DESC, purchase_order_number DESC
+    part_number,
+    plant,
+    po_number,
+    po_line_number,
+    po_quantity,
+    gr_quantity,
+    open_qty,
+    supplier_name,
+    buyer_code,
+    po_creation_date,
+    delivery_date,
+    need_by_date,
+    CAST(DATEDIFF(DAY, po_creation_date, delivery_date) AS INT) AS lead_time_days,
+    CAST(DATEDIFF(DAY, CAST(GETDATE() AS DATE), delivery_date) AS INT) AS remaining_days_to_delivery,
+    pace_dash
+FROM open_po_obs
+WHERE rn = 1
+ORDER BY part_number, plant, delivery_date DESC, po_number DESC
 """.strip()
 
+    print(f"DEBUG: PO Query - Parts: {cleaned_parts[:3]}... ({len(cleaned_parts)} total)")
+    print(f"DEBUG: PO Query - Plants: {cleaned_plants}")
+    
     conn = pyodbc.connect(f"DSN={_DSN}", autocommit=True)
     try:
         cursor = conn.cursor()
         cursor.execute(sql)
         columns = [desc[0] for desc in cursor.description]
         rows = cursor.fetchall()
+        print(f"DEBUG: PO Query returned {len(rows)} rows")
     finally:
         conn.close()
 

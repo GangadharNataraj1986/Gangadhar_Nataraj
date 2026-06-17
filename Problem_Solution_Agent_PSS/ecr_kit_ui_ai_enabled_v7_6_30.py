@@ -7005,19 +7005,15 @@ class InventoryCostTab(QWidget):
             'BOM Level',
             'Consumption Qty',
             'Platform',
-            'Config',
             'Build Quarter',
-            'SOCP Planned',
-            'SOCP Actual',
             'BOM Freez Planned',
-            'BPM Freez Actual',
+            'BOM Freez Actual',
+            'ECO Anchor Date',
             'SOP Date',
             'EOP Date',
             'Opportunity No',
             'Sales Order',
             'Customer',
-            'Actual Ship Date',
-            'Planned Ship Date',
         ])
         self.mapping_tree.setStyleSheet("""
             QTreeWidget { background:transparent; alternate-background-color:#F7FAFF; gridline-color:#E6E8F0; }
@@ -7204,14 +7200,10 @@ class InventoryCostTab(QWidget):
                 '',
                 '',
                 '',
-                '',
-                '',
-                '',
-                '',
             ])
             part_font = part_item.font(0)
             part_font.setBold(True)
-            for col in range(23):
+            for col in range(19):
                 part_item.setFont(col, part_font)
             if cholesterol == 'Good Cholesterol':
                 bg = QBrush(QColor('#D9F7EF'))
@@ -7219,10 +7211,10 @@ class InventoryCostTab(QWidget):
             else:
                 bg = QBrush(QColor('#FDE8E4'))
                 fg = QBrush(QColor('#9B2C2C'))
-            for col in range(23):
+            for col in range(19):
                 part_item.setBackground(col, bg)
                 part_item.setForeground(col, fg)
-                if col != 20:  # Center align all except Customer (col 20)
+                if col != 18:  # Center align all except Customer (col 18)
                     part_item.setTextAlignment(col, Qt.AlignmentFlag.AlignCenter)
                 if col == 9:  # Left align Platform (col 9)
                     part_item.setTextAlignment(col, Qt.AlignmentFlag.AlignLeft)
@@ -7255,10 +7247,10 @@ class InventoryCostTab(QWidget):
             part_item.setText(8, _fmt_value(total_consumption_qty) if part_rows else '')
             
             if not part_rows:
-                child = QTreeWidgetItem(['', '', '', '', '', 'No systems available', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', ''])
-                for col in range(23):
+                child = QTreeWidgetItem(['', '', '', '', '', 'No systems available', '', '', '', '', '', '', '', '', '', '', '', '', ''])
+                for col in range(19):
                     child.setBackground(col, QBrush(QColor('#FFFDF6')))
-                    if col != 20:  # Center align all except Customer (col 20)
+                    if col != 18:  # Center align all except Customer (col 18)
                         child.setTextAlignment(col, Qt.AlignmentFlag.AlignCenter)
                     if col == 9:  # Left align Platform (col 9)
                         child.setTextAlignment(col, Qt.AlignmentFlag.AlignLeft)
@@ -7272,12 +7264,10 @@ class InventoryCostTab(QWidget):
                 bom_level = _fmt_value(rec.get('bom_level', ''))
                 consumption_qty = _fmt_value(rec.get('consumption_qty', ''))
                 platform = str(rec.get('platform', '') or '').strip()
-                config = str(rec.get('config', '') or '').strip()
                 build_quarter = str(rec.get('build_quarter', '') or '').strip()
-                socp_planned = str(rec.get('socp_planned', '') or '').strip()
-                socp_actual = str(rec.get('socp_actual', '') or '').strip()
                 bom_freeze_planned = str(rec.get('bom_freeze_planned', '') or '').strip()
-                bpm_freeze_actual = str(rec.get('bpm_freeze_actual', '') or '').strip()
+                bom_freeze_actual = str(rec.get('bom_freeze_actual', '') or '').strip()
+                eco_anchor_date = str(rec.get('eco_anchor_date', '') or '').strip()
                 sop_date = str(rec.get('sop_date', '') or '').strip()
                 eop_date = str(rec.get('eop_date', '') or '').strip()
                 opportunity_no = str(rec.get('opportunity_no', '') or '').strip()
@@ -7295,23 +7285,19 @@ class InventoryCostTab(QWidget):
                     bom_level,
                     consumption_qty,
                     platform,
-                    config,
                     build_quarter,
-                    socp_planned,
-                    socp_actual,
                     bom_freeze_planned,
-                    bpm_freeze_actual,
+                    bom_freeze_actual,
+                    eco_anchor_date,
                     sop_date,
                     eop_date,
                     opportunity_no,
                     sales_order,
                     customer,
-                    _fmt_value(rec.get('actual_ship_date', '')),
-                    _fmt_value(rec.get('planned_ship_date', '')),
                 ])
-                for col in range(23):
+                for col in range(19):
                     child.setBackground(col, QBrush(QColor('#FFFDF6')))
-                    if col != 20:  # Center align all except Customer (col 20)
+                    if col != 18:  # Center align all except Customer (col 18)
                         child.setTextAlignment(col, Qt.AlignmentFlag.AlignCenter)
                     if col == 9:  # Left align Platform (col 9)
                         child.setTextAlignment(col, Qt.AlignmentFlag.AlignLeft)
