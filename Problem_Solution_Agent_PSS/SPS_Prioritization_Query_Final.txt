@@ -1,0 +1,734 @@
+-- =============================================================================
+-- SPS Parts Master Query - Production v3
+-- Excludes Closed/Rejected SPS, resolves PO/part fallback, and appends
+-- priority assessment logic using the refined output fields
+-- =============================================================================
+
+WITH
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- CONFIG: Adjustable weights and thresholds (EDIT VALUES HERE)
+-- Non-sparable weights must sum to 100, Sparable weights must sum to 100
+-- ═══════════════════════════════════════════════════════════════════════════════
+weight_config AS (
+  SELECT
+    -- NON-SPARABLE factor weights
+    33  AS w_sys_ns,       -- System Impact
+    29  AS w_inv_ns,       -- Inventory Impact (Applied)
+    23  AS w_po_ns,        -- PO NBD / Lead Time
+    15  AS w_fai_ns,       -- FAI Information
+    -- SPARABLE factor weights
+    27  AS w_sys_sp,       -- System Impact
+    25  AS w_inv_sp,       -- Inventory Impact (Applied)
+    18  AS w_po_sp,        -- PO NBD / Lead Time
+    15  AS w_fai_sp,       -- FAI Information
+    15  AS w_invsp_sp,     -- Inventory Impact (Spare / AGS)
+    -- PRIORITY BUCKET thresholds (score must be >= threshold)
+    85  AS p1_threshold,
+    70  AS p2_threshold,
+    50  AS p3_threshold,
+    30  AS p4_threshold
+),
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- CTE 1: SPS Base (Exclude Closed & Rejected + Problem + Request)
+-- ═══════════════════════════════════════════════════════════════════════════════
+sps_base AS (
+  SELECT
+    p.sps_id,
+    p.part_number,
+    p.part_revision,
+    p.sps_request_id,
+    p.itemstatus            AS part_status,
+    p.status                AS sps_status,
+    p.vendorcode            AS sps_vendor_code,
+    pr.original_po          AS sps_po_raw,
+    pr.problem_reason_code  AS sps_reason_code,
+    rq.supplier_name        AS sps_supplier_name
+  FROM prd.rd_sharepoint.sps_parts p
+  LEFT JOIN prd.rd_sharepoint.sps_problem pr
+    ON p.sps_id = pr.sps_id
+  LEFT JOIN prd.rd_sharepoint.sps_requests rq
+    ON p.sps_request_id = rq.sps_request_id
+  WHERE p.status NOT IN ('Closed', 'Rejected')
+),
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- CTE 2: PO Explosion - split original_po by delimiters, validate candidates
+-- ═══════════════════════════════════════════════════════════════════════════════
+po_exploded AS (
+  SELECT sps_id, part_number, TRIM(candidate_po) AS candidate_po
+  FROM (
+    SELECT sps_id, part_number, EXPLODE(SPLIT(sps_po_raw, '[,/&]+')) AS candidate_po
+    FROM sps_base
+    WHERE sps_po_raw IS NOT NULL AND TRIM(sps_po_raw) != ''
+  )
+  WHERE LENGTH(TRIM(candidate_po)) = 10
+    AND CAST(TRIM(candidate_po) AS BIGINT) IS NOT NULL
+    AND TRIM(candidate_po) NOT IN (
+      '0000000000','1111111111','2222222222','3333333333','4444444444',
+      '5555555555','6666666666','7777777777','8888888888','9999999999',
+      '1234567890','0123456789','9876543210'
+    )
+),
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- CTE 3: PO Resolution - confirm PO exists in SAP, rank by nearest po_date
+-- ═══════════════════════════════════════════════════════════════════════════════
+po_resolved AS (
+  SELECT
+    pe.sps_id,
+    pe.part_number,
+    pe.candidate_po,
+    ROW_NUMBER() OVER (
+      PARTITION BY pe.sps_id
+      ORDER BY ABS(DATEDIFF(CURRENT_DATE(), TRY_CAST(
+        CASE
+          WHEN fp.orgnlcmmitdate = '1900-01-01' AND fp.needbydate = '1900-01-01' THEN fp.cmmitdate
+          WHEN fp.orgnlcmmitdate = '1900-01-01' THEN fp.needbydate
+          WHEN fp.needbydate = '1900-01-01' THEN fp.orgnlcmmitdate
+          WHEN fp.orgnlcmmitdate < fp.needbydate THEN fp.orgnlcmmitdate
+          ELSE fp.needbydate
+        END AS DATE)
+      )) ASC
+    ) AS rn
+  FROM po_exploded pe
+  INNER JOIN prd.pd_mm.factposl fp
+    ON fp.pocd = pe.candidate_po
+    AND fp.materialnum = pe.part_number
+    AND fp.rflg = 1
+),
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- CTE 4a: Validated PO (from SPS original_po field)
+-- ═══════════════════════════════════════════════════════════════════════════════
+validated_po AS (
+  SELECT sps_id, part_number, candidate_po AS sps_po
+  FROM po_resolved
+  WHERE rn = 1
+),
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- CTE 4b: Fallback PO - when SPS has no valid PO, find by part_number
+-- Priority: Open PO > Closed, Plant group priority, then nearest po_date
+-- ═══════════════════════════════════════════════════════════════════════════════
+fallback_po AS (
+  SELECT
+    sb.sps_id,
+    sb.part_number,
+    fp.pocd AS fallback_pocd,
+    ROW_NUMBER() OVER (
+      PARTITION BY sb.sps_id
+      ORDER BY
+        CASE WHEN pol.status = 'OPEN' THEN 0 ELSE 1 END ASC,
+        CASE
+          WHEN fp.plantcd IN ('4060','4070','4080','4090') THEN 0
+          WHEN fp.plantcd IN ('4020','4030','4055') THEN 1
+          ELSE 2
+        END ASC,
+        ABS(DATEDIFF(CURRENT_DATE(), TRY_CAST(
+          CASE
+            WHEN fp.orgnlcmmitdate = '1900-01-01' AND fp.needbydate = '1900-01-01' THEN fp.cmmitdate
+            WHEN fp.orgnlcmmitdate = '1900-01-01' THEN fp.needbydate
+            WHEN fp.needbydate = '1900-01-01' THEN fp.orgnlcmmitdate
+            WHEN fp.orgnlcmmitdate < fp.needbydate THEN fp.orgnlcmmitdate
+            ELSE fp.needbydate
+          END AS DATE)
+        )) ASC
+    ) AS fb_rn
+  FROM sps_base sb
+  INNER JOIN prd.pd_mm.factposl fp
+    ON fp.materialnum = sb.part_number
+    AND fp.rflg = 1
+  LEFT JOIN prd.pd_mm.factpol pol
+    ON pol.pocd = fp.pocd
+    AND pol.materialnum = fp.materialnum
+    AND pol.rflg = 1
+  WHERE sb.sps_id NOT IN (SELECT sps_id FROM validated_po)
+),
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- CTE 4c: Final PO - merge SPS-validated PO + fallback PO with source flag
+-- ═══════════════════════════════════════════════════════════════════════════════
+final_po AS (
+  SELECT sps_id, part_number, sps_po, 'SPS' AS po_source FROM validated_po
+  UNION ALL
+  SELECT sps_id, part_number, fallback_pocd AS sps_po, 'Fallback' AS po_source
+  FROM fallback_po WHERE fb_rn = 1
+),
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- CTE 5: PO Header (factpol) - deduplicated by polcd
+-- ═══════════════════════════════════════════════════════════════════════════════
+po_header AS (
+  SELECT
+    pocd, polcd, materialnum,
+    status          AS po_status,
+    plantcd         AS po_plant,
+    vendorcd        AS po_vendorcd,
+    (COALESCE(CAST(planneddlvrytimeindays AS INT), 0)
+     + COALESCE(CAST(grprocessdays AS INT), 0)) AS po_lead_time,
+    ROW_NUMBER() OVER (
+      PARTITION BY pocd, materialnum
+      ORDER BY polcd ASC
+    ) AS ph_rn
+  FROM prd.pd_mm.factpol
+  WHERE rflg = 1
+),
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- CTE 6: PO Schedule (factposl) - joined on polcd for consistency
+-- ═══════════════════════════════════════════════════════════════════════════════
+po_schedule AS (
+  SELECT
+    pocd, polcd, materialnum, plantcd,
+    needbydate  AS po_nbd,
+    orgnlcmmitdate AS po_del_date,
+    dueqty, cmmitdate,
+    ROW_NUMBER() OVER (
+      PARTITION BY pocd, polcd, materialnum
+      ORDER BY cmmitdate ASC
+    ) AS ps_rn
+  FROM prd.pd_mm.factposl
+  WHERE rflg = 1
+),
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- CTE 7: Part Material (joined via PO plant)
+-- ═══════════════════════════════════════════════════════════════════════════════
+part_material AS (
+  SELECT
+    materialnum, plantcd,
+    crtclpart AS part_criticality,
+    planneddlvrydays AS part_full_lt,
+    CASE WHEN xdistrchainstatus = 'SP' THEN 'Yes' ELSE 'No' END AS spare_part
+  FROM prd.pd_mm.factplantmaterial
+  WHERE rflg = '1'
+),
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- CTE 7b: Part Material Fallback - for parts with no PO plant
+-- ═══════════════════════════════════════════════════════════════════════════════
+part_material_fallback AS (
+  SELECT
+    materialnum,
+    plantcd AS fallback_plantcd,
+    crtclpart AS part_criticality_fb,
+    planneddlvrydays AS part_full_lt_fb,
+    CASE WHEN xdistrchainstatus = 'SP' THEN 'Yes' ELSE 'No' END AS spare_part_fb,
+    ROW_NUMBER() OVER (
+      PARTITION BY materialnum
+      ORDER BY
+        CASE
+          WHEN plantcd IN ('4060','4070','4080','4090') THEN 0
+          WHEN plantcd IN ('4020','4030','4055') THEN 1
+          ELSE 2
+        END ASC,
+        plantcd ASC
+    ) AS pmf_rn
+  FROM prd.pd_mm.factplantmaterial
+  WHERE rflg = '1'
+),
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- CTE 8: PACE Part lookup - if pace='Y' for ANY site/supplier -> Yes, else No
+-- ═══════════════════════════════════════════════════════════════════════════════
+pace_lookup AS (
+  SELECT
+    part,
+    CASE WHEN MAX(CASE WHEN pace = 'Y' THEN 1 ELSE 0 END) = 1 THEN 'Yes' ELSE 'No' END AS pace_part
+  FROM prd.pd_mm.factspgsuplrfrcstivalua
+  GROUP BY part
+),
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- CTE 9: Slot Ranked - exclude junk values and keep earliest valid slot
+-- ═══════════════════════════════════════════════════════════════════════════════
+slot_ranked AS (
+  SELECT
+    spart, partsite, slotnum, sneeddate,
+    ROW_NUMBER() OVER (
+      PARTITION BY spart, partsite
+      ORDER BY from_unixtime(unix_timestamp(sneeddate, 'MM-dd-yy'), 'yyyy-MM-dd') ASC
+    ) AS rn
+  FROM prd.pd_mm.factknxssplyconsmp
+  WHERE slotnum IS NOT NULL
+    AND TRIM(slotnum) != ''
+    AND LENGTH(TRIM(slotnum)) >= 4
+    AND slotnum NOT IN ('CTIVEPLAN', 'PG-UPS', 'PG-OP')
+),
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- CTE 9b: Slot Assignment (first valid slot per part+plant)
+-- ═══════════════════════════════════════════════════════════════════════════════
+slot_assignment AS (
+  SELECT spart, partsite, slotnum
+  FROM slot_ranked
+  WHERE rn = 1
+),
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- CTE 10: TW Milestones (certified_system_summary)
+-- ═══════════════════════════════════════════════════════════════════════════════
+tw_milestones AS (
+  SELECT
+    system AS tw_system,
+    bom_freeze_actual_date,
+    bom_freeze_plan_date,
+    socp_actual_date,
+    socp_plan_date
+  FROM prd.pd_tw.certified_system_summary
+  WHERE system IS NOT NULL
+),
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- CTE 11: Demand Aggregation (13/26/52 week windows)
+-- ═══════════════════════════════════════════════════════════════════════════════
+demand_agg AS (
+  SELECT
+    spart, partsite,
+    SUM(CASE WHEN from_unixtime(unix_timestamp(sneeddate, 'MM-dd-yy'), 'yyyy-MM-dd')
+      <= CAST(DATE_ADD(CURRENT_DATE(), 91) AS STRING) THEN CAST(sneedqty AS DECIMAL(14,3)) ELSE 0 END) AS demand_13wk,
+    SUM(CASE WHEN from_unixtime(unix_timestamp(sneeddate, 'MM-dd-yy'), 'yyyy-MM-dd')
+      <= CAST(DATE_ADD(CURRENT_DATE(), 182) AS STRING) THEN CAST(sneedqty AS DECIMAL(14,3)) ELSE 0 END) AS demand_26wk,
+    SUM(CASE WHEN from_unixtime(unix_timestamp(sneeddate, 'MM-dd-yy'), 'yyyy-MM-dd')
+      <= CAST(DATE_ADD(CURRENT_DATE(), 364) AS STRING) THEN CAST(sneedqty AS DECIMAL(14,3)) ELSE 0 END) AS demand_52wk
+  FROM prd.pd_mm.factknxssplyconsmp
+  WHERE sneeddate IS NOT NULL AND TRIM(sneeddate) != ''
+  GROUP BY spart, partsite
+),
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- CTE 12: On-Hand Inventory
+-- ═══════════════════════════════════════════════════════════════════════════════
+on_hand AS (
+  SELECT materialnum, plantcode, SUM(qty) AS on_hand_qty
+  FROM prd.pd_inv.summonhandinv
+  WHERE rflg = 1
+  GROUP BY materialnum, plantcode
+),
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- CTE 13: On-Order (due quantities in time windows)
+-- ═══════════════════════════════════════════════════════════════════════════════
+on_order AS (
+  SELECT
+    materialnum, plantcd,
+    SUM(dueqty) AS on_order_total,
+    SUM(CASE WHEN cmmitdate <= CAST(DATE_ADD(CURRENT_DATE(), 91) AS STRING) THEN dueqty ELSE 0 END) AS on_order_91d,
+    SUM(CASE WHEN cmmitdate <= CAST(DATE_ADD(CURRENT_DATE(), 182) AS STRING) THEN dueqty ELSE 0 END) AS on_order_182d,
+    SUM(CASE WHEN cmmitdate <= CAST(DATE_ADD(CURRENT_DATE(), 364) AS STRING) THEN dueqty ELSE 0 END) AS on_order_364d
+  FROM prd.pd_mm.factposl
+  WHERE rflg = 1 AND dueqty > 0
+  GROUP BY materialnum, plantcd
+),
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- CTE 14: FAI Data with Vendor Name
+-- ═══════════════════════════════════════════════════════════════════════════════
+fai_with_vendor AS (
+  SELECT
+    fa.part_number,
+    fa.revision          AS fai_revision,
+    fa.sap_vendor_id,
+    fa.article_status_id,
+    fas.description      AS fai_status_desc,
+    fa.article_date      AS fai_expiry_date,
+    dv.vendorname1       AS fai_vendor_name
+  FROM prd.rd_sharepoint.fai_articles fa
+  LEFT JOIN prd.rd_sharepoint.fai_article_statuses fas
+    ON fa.article_status_id = fas.id
+  LEFT JOIN prd.pd_gcat.dimvendor dv
+    ON dv.vendorcd = fa.sap_vendor_id
+),
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- CTE 14b: FAI Ranked per SPS (supplier-prioritized matching)
+-- ═══════════════════════════════════════════════════════════════════════════════
+fai_ranked AS (
+  SELECT
+    sb.sps_id,
+    fw.part_number,
+    fw.fai_revision,
+    fw.sap_vendor_id,
+    fw.article_status_id,
+    fw.fai_status_desc,
+    fw.fai_expiry_date,
+    fw.fai_vendor_name,
+    ROW_NUMBER() OVER (
+      PARTITION BY sb.sps_id
+      ORDER BY
+        CASE
+          WHEN fw.sap_vendor_id = NULLIF(TRIM(sb.sps_vendor_code), '') THEN 0
+          WHEN LEFT(UPPER(TRIM(fw.fai_vendor_name)), 20) = LEFT(UPPER(TRIM(sb.sps_supplier_name)), 20) THEN 1
+          WHEN fw.article_status_id = 2 THEN 2
+          ELSE 3
+        END ASC,
+        ABS(DATEDIFF(CURRENT_DATE(), fw.fai_expiry_date)) ASC NULLS LAST
+    ) AS fai_rn
+  FROM sps_base sb
+  INNER JOIN fai_with_vendor fw
+    ON fw.part_number = sb.part_number
+),
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- CTE 15: Active vendor by name (normalized matching)
+-- ═══════════════════════════════════════════════════════════════════════════════
+active_vendor_by_name AS (
+  SELECT
+    LEFT(UPPER(TRIM(REGEXP_REPLACE(
+      vendorname1,
+      '\\b(INC|CORP|CORPORATION|LLC|LTD|LIMITED|CO|PTE|GMBH|AG|SRL|SA|NV|BV|SDN BHD)[.,\\s]*',
+      ''
+    ))), 25) AS vendor_match_key,
+    vendorcd,
+    ROW_NUMBER() OVER (
+      PARTITION BY LEFT(UPPER(TRIM(REGEXP_REPLACE(
+        vendorname1,
+        '\\b(INC|CORP|CORPORATION|LLC|LTD|LIMITED|CO|PTE|GMBH|AG|SRL|SA|NV|BV|SDN BHD)[.,\\s]*',
+        ''
+      ))), 25)
+      ORDER BY vendorcd ASC
+    ) AS vrn
+  FROM prd.pd_gcat.dimvendor
+  WHERE vendorname1 IS NOT NULL AND TRIM(vendorname1) != ''
+),
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- CTE 16: Refined SPS Parts Master output
+-- Preserves the existing v3 output columns and fallback indicators
+-- ═══════════════════════════════════════════════════════════════════════════════
+base_output AS (
+  SELECT
+    sb.sps_id,
+    sb.part_number,
+    sb.part_revision,
+    vp.sps_po,
+    sb.sps_supplier_name,
+    COALESCE(
+      NULLIF(TRIM(sb.sps_vendor_code), ''),
+      ph.po_vendorcd,
+      avn.vendorcd
+    ) AS sps_supplier_id,
+    CASE
+      WHEN NULLIF(TRIM(sb.sps_vendor_code), '') IS NOT NULL THEN 'SPS Direct'
+      WHEN ph.po_vendorcd IS NOT NULL THEN 'PO Vendor'
+      WHEN avn.vendorcd IS NOT NULL THEN 'Name Match'
+      ELSE NULL
+    END AS supplier_id_source,
+    sb.part_status,
+    sb.sps_status,
+    sb.sps_reason_code,
+    COALESCE(pm.part_criticality, pmf.part_criticality_fb) AS part_criticality,
+    CASE
+      WHEN pm.part_criticality IS NOT NULL THEN 'PO Plant'
+      WHEN pmf.part_criticality_fb IS NOT NULL THEN 'Fallback Plant'
+      ELSE NULL
+    END AS part_data_source,
+    ph.po_status,
+    ph.po_plant,
+    COALESCE(pl.pace_part, 'No') AS pace_part,
+    COALESCE(pm.spare_part, pmf.spare_part_fb, 'No') AS spare_part,
+    ps.po_nbd,
+    ps.po_del_date,
+    CASE
+      WHEN ps.po_del_date = '1900-01-01' AND ps.po_nbd = '1900-01-01' THEN NULL
+      WHEN ps.po_del_date = '1900-01-01' THEN ps.po_nbd
+      WHEN ps.po_nbd = '1900-01-01' THEN ps.po_del_date
+      WHEN ps.po_del_date < ps.po_nbd THEN ps.po_del_date
+      ELSE ps.po_nbd
+    END AS po_date,
+    vp.po_source,
+    ph.po_lead_time,
+    COALESCE(pm.part_full_lt, pmf.part_full_lt_fb) AS part_full_lt,
+    sa.slotnum AS slot_no,
+    tw.bom_freeze_actual_date,
+    tw.bom_freeze_plan_date,
+    tw.socp_actual_date,
+    tw.socp_plan_date,
+    da.demand_13wk,
+    da.demand_26wk,
+    da.demand_52wk,
+    oh.on_hand_qty AS on_hand,
+    oo.on_order_total AS on_order,
+    (COALESCE(oh.on_hand_qty, 0) + COALESCE(oo.on_order_91d, 0)) AS inventory_13wk,
+    (COALESCE(oh.on_hand_qty, 0) + COALESCE(oo.on_order_182d, 0)) AS inventory_26wk,
+    (COALESCE(oh.on_hand_qty, 0) + COALESCE(oo.on_order_364d, 0)) AS inventory_52wk,
+    fr.part_number AS fai_part_number,
+    fr.fai_revision AS fai_part_revision,
+    COALESCE(fr.fai_vendor_name, fr.sap_vendor_id) AS fai_supplier,
+    CONCAT_WS(' - ', CAST(fr.article_status_id AS STRING), fr.fai_status_desc) AS fai_status,
+    fr.fai_expiry_date,
+    CASE
+      WHEN fr.sps_id IS NULL THEN NULL
+      WHEN fr.sap_vendor_id = NULLIF(TRIM(sb.sps_vendor_code), '') THEN 'Vendor ID Match'
+      WHEN LEFT(UPPER(TRIM(fr.fai_vendor_name)), 20) = LEFT(UPPER(TRIM(sb.sps_supplier_name)), 20) THEN 'Name Match'
+      WHEN fr.article_status_id = 2 THEN 'Approved Fallback'
+      ELSE 'Other Fallback'
+    END AS fai_match_type,
+    NULL AS ags_otd_priority
+  FROM sps_base sb
+  LEFT JOIN final_po vp
+    ON vp.sps_id = sb.sps_id
+  LEFT JOIN po_header ph
+    ON ph.pocd = vp.sps_po
+    AND ph.materialnum = sb.part_number
+    AND ph.ph_rn = 1
+  LEFT JOIN po_schedule ps
+    ON ps.pocd = vp.sps_po
+    AND ps.materialnum = sb.part_number
+    AND ps.polcd = ph.polcd
+    AND ps.ps_rn = 1
+  LEFT JOIN part_material pm
+    ON pm.materialnum = sb.part_number
+    AND pm.plantcd = ph.po_plant
+  LEFT JOIN part_material_fallback pmf
+    ON pmf.materialnum = sb.part_number
+    AND pmf.pmf_rn = 1
+  LEFT JOIN pace_lookup pl
+    ON pl.part = sb.part_number
+  LEFT JOIN slot_assignment sa
+    ON sa.spart = sb.part_number
+    AND sa.partsite = COALESCE(ph.po_plant, pmf.fallback_plantcd)
+  LEFT JOIN tw_milestones tw
+    ON tw.tw_system = sa.slotnum
+  LEFT JOIN demand_agg da
+    ON da.spart = sb.part_number
+    AND da.partsite = COALESCE(ph.po_plant, pmf.fallback_plantcd)
+  LEFT JOIN on_hand oh
+    ON oh.materialnum = sb.part_number
+    AND oh.plantcode = COALESCE(ph.po_plant, pmf.fallback_plantcd)
+  LEFT JOIN on_order oo
+    ON oo.materialnum = sb.part_number
+    AND oo.plantcd = COALESCE(ph.po_plant, pmf.fallback_plantcd)
+  LEFT JOIN fai_ranked fr
+    ON fr.sps_id = sb.sps_id
+    AND fr.fai_rn = 1
+  LEFT JOIN active_vendor_by_name avn
+    ON LEFT(UPPER(TRIM(REGEXP_REPLACE(
+      sb.sps_supplier_name,
+      '\\b(INC|CORP|CORPORATION|LLC|LTD|LIMITED|CO|PTE|GMBH|AG|SRL|SA|NV|BV|SDN BHD)[.,\\s]*',
+      ''
+    ))), 25) = avn.vendor_match_key
+    AND avn.vrn = 1
+),
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- CTE 17: Priority impact factors
+-- ═══════════════════════════════════════════════════════════════════════════════
+priority_impacts AS (
+  SELECT
+    b.*,
+    CASE
+      WHEN NULLIF(TRIM(b.slot_no), '') IS NOT NULL
+        AND b.bom_freeze_actual_date IS NOT NULL
+        AND CURRENT_DATE() >= b.bom_freeze_actual_date THEN 'High'
+      WHEN NULLIF(TRIM(b.slot_no), '') IS NOT NULL
+        AND (
+          (b.socp_actual_date IS NOT NULL AND CURRENT_DATE() >= b.socp_actual_date)
+          OR (b.bom_freeze_plan_date IS NOT NULL AND CURRENT_DATE() >= b.bom_freeze_plan_date)
+          OR (b.socp_plan_date IS NOT NULL AND CURRENT_DATE() >= b.socp_plan_date)
+        ) THEN 'Medium'
+      ELSE 'Low'
+    END AS system_impact,
+    CASE
+      WHEN COALESCE(b.demand_13wk, 0) > 0
+        AND COALESCE(b.demand_13wk, 0) >= COALESCE(b.inventory_13wk, 0) THEN 'High'
+      WHEN (
+        (COALESCE(b.demand_26wk, 0) > 0 AND COALESCE(b.demand_26wk, 0) >= COALESCE(b.inventory_26wk, 0))
+        OR (COALESCE(b.demand_52wk, 0) > 0 AND COALESCE(b.demand_52wk, 0) >= COALESCE(b.inventory_52wk, 0))
+      ) THEN 'Medium'
+      WHEN COALESCE(b.demand_13wk, 0) < COALESCE(b.on_hand, 0)
+        AND COALESCE(b.demand_26wk, 0) < COALESCE(b.on_hand, 0)
+        AND COALESCE(b.demand_52wk, 0) < COALESCE(b.on_hand, 0) THEN 'Low'
+      ELSE 'Low'
+    END AS inventory_impact_applied,
+    CASE
+      WHEN b.spare_part = 'Yes' AND b.ags_otd_priority IN ('P1.0','P1.1','P1.11','P1.2','P1.3') THEN 'High'
+      WHEN b.spare_part = 'Yes' AND b.ags_otd_priority IN ('P1.4','P1.5','P2') THEN 'Medium'
+      WHEN b.spare_part = 'Yes' AND b.ags_otd_priority IN ('P3','P4','P5','P6') THEN 'Low'
+      WHEN b.spare_part = 'Yes' THEN NULL
+      ELSE NULL
+    END AS inventory_impact_spare,
+    CASE
+      WHEN b.pace_part = 'Yes' THEN 'High'
+      WHEN b.po_date IS NOT NULL
+        AND DATEDIFF(b.po_date, CURRENT_DATE()) <= 14 THEN 'High'
+      WHEN b.po_date IS NOT NULL
+        AND COALESCE(TRY_CAST(b.po_lead_time AS INT), TRY_CAST(b.part_full_lt AS INT)) IS NOT NULL
+        AND DATEDIFF(b.po_date, CURRENT_DATE()) <= COALESCE(TRY_CAST(b.po_lead_time AS INT), TRY_CAST(b.part_full_lt AS INT)) THEN 'High'
+      WHEN b.po_date IS NOT NULL
+        AND DATEDIFF(b.po_date, CURRENT_DATE()) > 14
+        AND DATEDIFF(b.po_date, CURRENT_DATE()) < 28 THEN 'Medium'
+      WHEN b.po_date IS NOT NULL
+        AND COALESCE(TRY_CAST(b.po_lead_time AS INT), TRY_CAST(b.part_full_lt AS INT)) IS NOT NULL
+        AND (DATEDIFF(b.po_date, CURRENT_DATE()) - COALESCE(TRY_CAST(b.po_lead_time AS INT), TRY_CAST(b.part_full_lt AS INT))) < 14 THEN 'Medium'
+      WHEN b.po_date IS NOT NULL
+        AND DATEDIFF(b.po_date, CURRENT_DATE()) >= 28 THEN 'Low'
+      WHEN b.po_date IS NOT NULL
+        AND COALESCE(TRY_CAST(b.po_lead_time AS INT), TRY_CAST(b.part_full_lt AS INT)) IS NOT NULL
+        AND (DATEDIFF(b.po_date, CURRENT_DATE()) - COALESCE(TRY_CAST(b.po_lead_time AS INT), TRY_CAST(b.part_full_lt AS INT))) > 14 THEN 'Low'
+      WHEN (b.sps_po IS NULL OR b.po_date IS NULL)
+        AND COALESCE(b.pace_part, 'No') != 'Yes' THEN 'Low'
+      ELSE 'Low'
+    END AS po_nbd_leadtime_impact,
+    CASE
+      WHEN UPPER(COALESCE(b.part_status, '')) = 'CONCEPT' THEN 'Low'
+      WHEN b.fai_part_number IS NULL
+        AND b.fai_status IS NULL
+        AND b.fai_supplier IS NULL THEN 'Low'
+      WHEN b.fai_match_type IN ('Vendor ID Match', 'Name Match')
+        AND (
+          UPPER(COALESCE(b.fai_status, '')) LIKE '%DRAFT%'
+          OR UPPER(COALESCE(b.fai_status, '')) LIKE '%REJECT%'
+          OR UPPER(COALESCE(b.fai_status, '')) LIKE '%EXPIRED%'
+          OR (b.fai_expiry_date IS NOT NULL AND b.fai_expiry_date < ADD_MONTHS(CURRENT_DATE(), 1))
+        ) THEN 'High'
+      WHEN (
+        UPPER(COALESCE(b.part_criticality, '')) LIKE '%CRIT%'
+        OR UPPER(COALESCE(b.part_criticality, '')) IN ('Y', 'YES', '1')
+      )
+        AND (
+          UPPER(COALESCE(b.fai_status, '')) LIKE '%APPROV%'
+          OR UPPER(COALESCE(b.fai_status, '')) LIKE '%ACCEPT%'
+        )
+        AND COALESCE(TRIM(b.fai_part_revision), '') != COALESCE(TRIM(b.part_revision), '') THEN 'High'
+      WHEN b.fai_match_type IN ('Vendor ID Match', 'Name Match')
+        AND COALESCE(TRIM(b.fai_status), '') = '' THEN 'Medium'
+      WHEN b.fai_match_type IN ('Vendor ID Match', 'Name Match')
+        AND b.fai_expiry_date IS NOT NULL
+        AND b.fai_expiry_date >= ADD_MONTHS(CURRENT_DATE(), 1)
+        AND b.fai_expiry_date < ADD_MONTHS(CURRENT_DATE(), 6) THEN 'Medium'
+      WHEN b.fai_match_type IN ('Vendor ID Match', 'Name Match')
+        AND (
+          UPPER(COALESCE(b.fai_status, '')) LIKE '%APPROV%'
+          OR UPPER(COALESCE(b.fai_status, '')) LIKE '%ACCEPT%'
+        )
+        AND COALESCE(b.demand_13wk, 0) > 0 THEN 'Medium'
+      WHEN b.fai_match_type IN ('Vendor ID Match', 'Name Match')
+        AND (
+          UPPER(COALESCE(b.fai_status, '')) LIKE '%APPROV%'
+          OR UPPER(COALESCE(b.fai_status, '')) LIKE '%ACCEPT%'
+        )
+        AND COALESCE(b.demand_13wk, 0) <= 0 THEN 'Low'
+      ELSE 'Low'
+    END AS fai_impact
+  FROM base_output b
+),
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- CTE 18: Priority severity weights
+-- ═══════════════════════════════════════════════════════════════════════════════
+priority_weights AS (
+  SELECT
+    pi.*,
+    CASE pi.system_impact
+      WHEN 'High' THEN 1.0
+      WHEN 'Medium' THEN 0.6
+      WHEN 'Low' THEN 0.2
+      ELSE NULL
+    END AS system_severity_weight,
+    CASE pi.inventory_impact_applied
+      WHEN 'High' THEN 1.0
+      WHEN 'Medium' THEN 0.6
+      WHEN 'Low' THEN 0.2
+      ELSE NULL
+    END AS inventory_applied_severity_weight,
+    CASE pi.inventory_impact_spare
+      WHEN 'High' THEN 1.0
+      WHEN 'Medium' THEN 0.6
+      WHEN 'Low' THEN 0.2
+      ELSE NULL
+    END AS inventory_spare_severity_weight,
+    CASE pi.po_nbd_leadtime_impact
+      WHEN 'High' THEN 1.0
+      WHEN 'Medium' THEN 0.6
+      WHEN 'Low' THEN 0.2
+      ELSE NULL
+    END AS po_severity_weight,
+    CASE pi.fai_impact
+      WHEN 'High' THEN 1.0
+      WHEN 'Medium' THEN 0.6
+      WHEN 'Low' THEN 0.2
+      ELSE NULL
+    END AS fai_severity_weight
+  FROM priority_impacts pi
+),
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- CTE 19: Priority score
+-- ═══════════════════════════════════════════════════════════════════════════════
+priority_scoring AS (
+  SELECT
+    pw.*,
+    CASE
+      WHEN pw.spare_part = 'Yes' AND pw.inventory_spare_severity_weight IS NOT NULL THEN
+        (COALESCE(pw.system_severity_weight, 0) * wc.w_sys_sp)
+        + (COALESCE(pw.inventory_applied_severity_weight, 0) * wc.w_inv_sp)
+        + (COALESCE(pw.po_severity_weight, 0) * wc.w_po_sp)
+        + (COALESCE(pw.fai_severity_weight, 0) * wc.w_fai_sp)
+        + (COALESCE(pw.inventory_spare_severity_weight, 0) * wc.w_invsp_sp)
+      ELSE
+        (COALESCE(pw.system_severity_weight, 0) * wc.w_sys_ns)
+        + (COALESCE(pw.inventory_applied_severity_weight, 0) * wc.w_inv_ns)
+        + (COALESCE(pw.po_severity_weight, 0) * wc.w_po_ns)
+        + (COALESCE(pw.fai_severity_weight, 0) * wc.w_fai_ns)
+    END AS framework_priority_score
+  FROM priority_weights pw
+  CROSS JOIN weight_config wc
+),
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- CTE 20: Framework and AGS buckets
+-- ═══════════════════════════════════════════════════════════════════════════════
+priority_buckets AS (
+  SELECT
+    ps.*,
+    CASE
+      WHEN ps.framework_priority_score >= wc.p1_threshold THEN 'P1'
+      WHEN ps.framework_priority_score >= wc.p2_threshold THEN 'P2'
+      WHEN ps.framework_priority_score >= wc.p3_threshold THEN 'P3'
+      WHEN ps.framework_priority_score >= wc.p4_threshold THEN 'P4'
+      ELSE 'P5'
+    END AS framework_priority_bucket,
+    CASE
+      WHEN ps.spare_part = 'Yes' AND ps.ags_otd_priority IN ('P1.0','P1.1','P1.11','P1.2','P1.3') THEN 'P1'
+      WHEN ps.spare_part = 'Yes' AND ps.ags_otd_priority IN ('P1.4','P1.5','P2') THEN 'P2'
+      WHEN ps.spare_part = 'Yes' AND ps.ags_otd_priority = 'P3' THEN 'P3'
+      WHEN ps.spare_part = 'Yes' AND ps.ags_otd_priority = 'P4' THEN 'P4'
+      WHEN ps.spare_part = 'Yes' AND ps.ags_otd_priority IN ('P5', 'P6') THEN 'P5'
+      ELSE NULL
+    END AS ags_comparable_priority
+  FROM priority_scoring ps
+  CROSS JOIN weight_config wc
+)
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- FINAL SELECT: Refined output + appended priority assessment columns
+-- ═══════════════════════════════════════════════════════════════════════════════
+SELECT
+  pb.*,
+  CASE
+    WHEN pb.spare_part = 'Yes' AND pb.ags_otd_priority IN ('P1.0','P1.1','P1.11','P1.2','P1.3') THEN 'P1'
+    WHEN pb.spare_part = 'Yes' AND pb.ags_comparable_priority IS NOT NULL AND pb.framework_priority_bucket IS NOT NULL THEN
+      CASE
+        WHEN CASE pb.framework_priority_bucket
+          WHEN 'P1' THEN 1
+          WHEN 'P2' THEN 2
+          WHEN 'P3' THEN 3
+          WHEN 'P4' THEN 4
+          WHEN 'P5' THEN 5
+          ELSE 99
+        END <= CASE pb.ags_comparable_priority
+          WHEN 'P1' THEN 1
+          WHEN 'P2' THEN 2
+          WHEN 'P3' THEN 3
+          WHEN 'P4' THEN 4
+          WHEN 'P5' THEN 5
+          ELSE 99
+        END THEN pb.framework_priority_bucket
+        ELSE pb.ags_comparable_priority
+      END
+    WHEN pb.spare_part = 'Yes' THEN pb.framework_priority_bucket
+    ELSE pb.framework_priority_bucket
+  END AS final_priority_bucket
+FROM priority_buckets pb

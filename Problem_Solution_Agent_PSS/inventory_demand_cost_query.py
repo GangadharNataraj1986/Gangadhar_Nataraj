@@ -263,6 +263,79 @@ def fetch_inventory_demand_cost(
     return results
 
 
+def fetch_inventory_demand_mapping(parts: Iterable[str]) -> list[dict[str, Any]]:
+    """Query Databricks and return inventory-demand mapping rows for Inventory_Demand_Mapping tab.
+    
+    Returns a list of dicts with demand order information (system numbers, consumption qty, dates, etc.)
+    for the requested OBS parts.
+    """
+    cleaned_parts = _clean_parts(parts)
+    if not cleaned_parts:
+        return []
+
+    try:
+        import pyodbc  # type: ignore[import]
+    except ImportError as exc:  # pragma: no cover
+        raise RuntimeError(
+            "pyodbc is not installed. Install it with: pip install pyodbc"
+        ) from exc
+
+    # Remove special characters from parts for the SQL filter (same way as dpart is normalized in the table)
+    import re
+    normalized_parts = [re.sub(r'[^A-Za-z0-9]', '', p) for p in cleaned_parts]
+    part_filter = ", ".join(f"'{p}'" for p in normalized_parts)
+
+    # Query factknxssplyconsmp for demand order details
+    sql = f"""
+SELECT
+    TRIM(UPPER(CAST(dpart AS STRING)))                               AS part_number,
+    COALESCE(
+        NULLIF(TRIM(CAST(dorderid AS STRING)), ''),
+        NULLIF(TRIM(CAST(slotnum AS STRING)), ''),
+        NULLIF(TRIM(CAST(sordid AS STRING)), ''),
+        NULLIF(TRIM(CAST(indpndntdmndordid AS STRING)), ''),
+        NULLIF(TRIM(CAST(pegpartname AS STRING)), ''),
+        ''
+    )                                                                 AS system_number,
+    CAST(COALESCE(dqty, 0) AS DECIMAL(18, 3))                        AS consumption_qty,
+    ''                                                                AS parent_part,
+    0                                                                 AS bom_level,
+    ''                                                                AS platform,
+    ''                                                                AS config,
+    ''                                                                AS build_quarter,
+    ''                                                                AS socp_planned,
+    ''                                                                AS socp_actual,
+    ''                                                                AS bom_freeze_planned,
+    ''                                                                AS bpm_freeze_actual,
+    CAST(sstartdate AS STRING)                                        AS sop_date,
+    CAST(sduedate AS STRING)                                          AS eop_date,
+    ''                                                                AS opportunity_no,
+    ''                                                                AS sales_order,
+    ''                                                                AS customer,
+    CAST(sduedate AS STRING)                                          AS actual_ship_date,
+    CAST(sduedate AS STRING)                                          AS planned_ship_date
+FROM prd.pd_mm.factknxssplyconsmp
+WHERE UPPER(REGEXP_REPLACE(CAST(dpart AS STRING), '[^A-Za-z0-9]', '')) IN ({part_filter})
+ORDER BY part_number, system_number
+""".strip()
+
+    conn = pyodbc.connect(f"DSN={_DSN}", autocommit=True)
+    try:
+        cursor = conn.cursor()
+        cursor.execute(sql)
+        columns = [desc[0] for desc in cursor.description]
+        rows = cursor.fetchall()
+    finally:
+        conn.close()
+
+    results: list[dict[str, Any]] = []
+    for row in rows:
+        rec = {columns[idx]: row[idx] for idx in range(len(columns))}
+        results.append(rec)
+    
+    return results
+
+
 def fetch_open_purchase_order_details(
     parts: Iterable[str],
     plants: Sequence[str] | None = None,

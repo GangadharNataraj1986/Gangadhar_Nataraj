@@ -1,0 +1,5 @@
+Traceback (most recent call last):
+  File "c:\Users\e187725\OneDrive - Applied Materials\Desktop\Orphan Anlsysis Pyt\Problem_Solution_Agent_PSS\ecr_kit_ui_ai_enabled_v7_6_30.py", line 15097, in _do_find
+    t.scrollToItem(it, QTableWidget.ScrollHint.PositionAtCenter)
+    ~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+RuntimeError: wrapped C/C++ object of type QTableWidgetItem has been deleted
