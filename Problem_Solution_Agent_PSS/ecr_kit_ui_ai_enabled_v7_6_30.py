@@ -6839,10 +6839,9 @@ class InventoryCostTab(QWidget):
         self.table.clear()
         self.table.setRowCount(0)
         self.table.setColumnCount(0)
-        self.po_table.clear()
-        self.po_table.setRowCount(0)
-        self.po_table.setColumnCount(0)
-        self.po_viz_list.clear()
+        if hasattr(self, 'po_table'):
+            self.po_table.clear()
+            self.po_table.setColumnCount(0)
         if hasattr(self, 'mapping_tree'):
             self.mapping_tree.clear()
         if hasattr(self, 'mapping_status'):
@@ -6931,46 +6930,21 @@ class InventoryCostTab(QWidget):
         open_po_layout.addLayout(po_status_row)
         
         # Horizontal layout for visualization + table
-        po_content_layout = QHBoxLayout()
+        po_content_layout = QVBoxLayout()
         po_content_layout.setContentsMargins(8, 8, 8, 8)
-        
-        # Left side: Remaining Days visualization
-        po_left_widget = QWidget()
-        po_left_layout = QVBoxLayout(po_left_widget)
-        po_left_layout.setContentsMargins(0, 0, 16, 0)
-        
-        self.po_viz_label = QLabel('Remaining Days\nto Delivery')
-        self.po_viz_label.setAlignment(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignTop)
-        self.po_viz_label.setStyleSheet('font-weight:700;color:#0369A1;')
-        po_left_layout.addWidget(self.po_viz_label)
-        
-        self.po_viz_list = QListWidget()
-        self.po_viz_list.setMinimumWidth(180)
-        self.po_viz_list.setMaximumWidth(200)
-        self.po_viz_list.setStyleSheet("""
-            QListWidget { background:transparent; border:none; }
-            QListWidget::item { padding:4px; margin:2px 0px; }
-        """)
-        po_left_layout.addWidget(self.po_viz_list, 1)
-        po_content_layout.addWidget(po_left_widget, 0)
-        
-        # Right side: PO Details table
-        po_right_widget = QWidget()
-        po_right_layout = QVBoxLayout(po_right_widget)
-        po_right_layout.setContentsMargins(0, 0, 0, 0)
-        
-        self.po_table = QTableWidget(0, 0)
+
+        self.po_table = QTreeWidget()
         self.po_table.setAlternatingRowColors(True)
-        self.po_table.horizontalHeader().setVisible(True)
+        self.po_table.setRootIsDecorated(True)
+        self.po_table.setUniformRowHeights(True)
+        self.po_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.po_table.setStyleSheet("""
-            QTableWidget { background:transparent; alternate-background-color:transparent; gridline-color:#E6E8F0; }
+            QTreeWidget { background:transparent; alternate-background-color:#F7FAFF; gridline-color:#E6E8F0; }
             QHeaderView::section { background:#E1F0FF; color:#0F2D46; font-weight:600; border:1px solid #C9E2FF; padding:4px; }
-            QTableWidget::item:selected { background:#DDF1FF; color:#0F2D46; }
-            QTableWidget::item { padding:2px; }
+            QTreeWidget::item:selected { background:#DDF1FF; color:#0F2D46; }
         """)
-        po_right_layout.addWidget(self.po_table)
-        po_content_layout.addWidget(po_right_widget, 1)
-        
+        po_content_layout.addWidget(self.po_table, 1)
+
         open_po_layout.addLayout(po_content_layout, 1)
         
         self.po_rows = []
@@ -7312,14 +7286,12 @@ class InventoryCostTab(QWidget):
         )
 
     def _render_open_po_view(self):
-        """Render Open PO table with remaining days visualization."""
+        """Render Open PO report as a grouped hierarchy by material number."""
         if not hasattr(self, 'po_table'):
             return
         
         self.po_table.clear()
-        self.po_table.setRowCount(0)
         self.po_table.setColumnCount(0)
-        self.po_viz_list.clear()
         
         po_rows = getattr(self, 'po_rows', []) or []
         if not po_rows:
@@ -7338,29 +7310,34 @@ class InventoryCostTab(QWidget):
                 msg += f' (Searched {obs_parts_count} OBS part(s))'
             self.po_status.setText(msg)
             return
-        
-        # Define table columns
         columns = [
-            'Part Number',
-            'PACE',
+            'Material Number',
+            'Description',
             'PO Number',
-            'Lead Time (LT)',
-            'PO Quantity',
-            'GR Quantity',
-            'Open Quantity',
+            'SNG Status',
+            'PACE',
+            'Plant',
+            'Scheduled Qty',
+            'GR Qty',
+            'Open Qty',
             'PO Creation Date',
             'Delivery Date',
             'Need By Date',
-            'PO Created by',
-            'Remaining Days',
-            'Recommendation'
+            'Price (USD)',
+            'PO Status',
+            'Lead Time (LT)',
+            'PO Age (Days)',
+            'PO Age %',
+            'Balance Days to Delivery',
         ]
-        
+
         self.po_table.setColumnCount(len(columns))
-        self.po_table.setHorizontalHeaderLabels(columns)
-        self.po_table.setRowCount(len(po_rows))
+        self.po_table.setHeaderLabels(columns)
         
-        # Helper function to format values
+        # Center align all headers
+        header = self.po_table.header()
+        header.setDefaultAlignment(Qt.AlignmentFlag.AlignCenter)
+        
         def fmt_value(val):
             if val is None:
                 return ''
@@ -7374,6 +7351,13 @@ class InventoryCostTab(QWidget):
                 return f'{num:.2f}'
             except:
                 return text
+
+        def fmt_money(val):
+            try:
+                num = float(val)
+            except Exception:
+                return ''
+            return f'{num:,.2f}'
         
         def fmt_date(date_val):
             if date_val is None:
@@ -7383,96 +7367,256 @@ class InventoryCostTab(QWidget):
                 return ''
             return text[:10]  # Format as YYYY-MM-DD
         
-        # Populate table rows
-        for row_idx, po_row in enumerate(po_rows):
-            part_number = str(po_row.get('part_number', '') or '').strip()
-            pace = str(po_row.get('pace_dash', '') or '').strip()
-            po_number = str(po_row.get('po_number', '') or '').strip()
-            lead_time_days = int(po_row.get('lead_time_days', 0) or 0)
-            remaining_days = int(po_row.get('remaining_days_to_delivery', 0) or 0)
-            po_qty = fmt_value(po_row.get('po_quantity'))
-            gr_qty = fmt_value(po_row.get('gr_quantity'))
-            open_qty = fmt_value(po_row.get('open_qty'))
-            po_creation_date = fmt_date(po_row.get('po_creation_date'))
-            delivery_date = fmt_date(po_row.get('delivery_date'))
-            need_by_date = fmt_date(po_row.get('need_by_date'))
-            buyer = str(po_row.get('buyer_code', '') or '').strip()
-            
-            # Calculate recommendation: if remaining days >= 80% of lead time (if LT is known)
-            # For now, show remaining days
-            recommendation = ''
-            if lead_time_days > 0:
-                threshold = int(lead_time_days * 0.8)  # 80% of lead time
-                if remaining_days >= threshold:
-                    recommendation = '✅ Recommend PO Cancellation'
-                else:
-                    recommendation = '⏳ On Track'
-            elif remaining_days < 0:
-                recommendation = '❌ Overdue'
+        def parse_date(date_str):
+            """Parse date string to datetime.date object."""
+            if not date_str:
+                return None
+            date_str = str(date_str).strip()
+            if date_str in ('', 'nan', 'None', '1900-01-01'):
+                return None
+            try:
+                from datetime import datetime
+                # Try standard formats
+                for fmt in ('%Y-%m-%d', '%Y-%m-%d %H:%M:%S'):
+                    try:
+                        return datetime.strptime(date_str, fmt).date()
+                    except:
+                        continue
+                return None
+            except:
+                return None
+
+        def make_age_bar_widget(age_pct: float) -> QWidget:
+            container = QWidget()
+            layout = QHBoxLayout(container)
+            layout.setContentsMargins(0, 0, 0, 0)
+            layout.setSpacing(0)
+
+            bar = QProgressBar()
+            bar.setRange(0, 100)
+            bar.setTextVisible(True)
+            bar.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            display_pct = max(0.0, float(age_pct or 0.0))
+            bar.setValue(min(int(round(display_pct)), 100))
+            bar.setFormat(f'{display_pct:.1f}%')
+            if display_pct < 20:
+                bar.setStyleSheet(
+                    'QProgressBar { border:1px solid rgba(34, 197, 94, 0.35); background:rgba(34, 197, 94, 0.08); color:#166534; text-align:center; } '
+                    'QProgressBar::chunk { background:rgba(34, 197, 94, 0.35); }'
+                )
             else:
-                recommendation = f'{remaining_days} days'
+                bar.setStyleSheet(
+                    'QProgressBar { border:1px solid rgba(220, 38, 38, 0.35); background:rgba(220, 38, 38, 0.08); color:#991B1B; text-align:center; } '
+                    'QProgressBar::chunk { background:rgba(220, 38, 38, 0.35); }'
+                )
+            layout.addWidget(bar)
+            return container
+        
+        # Get today's date for calculations
+        today = datetime.now().date()
+        material_groups: dict[str, dict[str, Any]] = {}
+
+        def _norm_part(value: Any) -> str:
+            return re.sub(r'[^A-Z0-9]', '', str(value or '').strip().upper())
+
+        for po_row in po_rows:
+            material_number = str(po_row.get('material_number', '') or '').strip()
+            if not material_number:
+                continue
+            group = material_groups.setdefault(
+                material_number,
+                {
+                    'description': str(po_row.get('description', '') or '').strip(),
+                    'rows': [],
+                },
+            )
+            if not group.get('description'):
+                group['description'] = str(po_row.get('description', '') or '').strip()
+            group['rows'].append(po_row)
+
+        self.po_table.setAnimated(False)
+        self.po_table.setItemsExpandable(True)
+        self.po_table.setExpandsOnDoubleClick(True)
+
+        obs_parts_order = getattr(self, '_obs_parts_order', []) or []
+        obs_order_index = {
+            _norm_part(part): idx
+            for idx, part in enumerate(obs_parts_order)
+            if _norm_part(part)
+        }
+        insertion_index = {mat: idx for idx, mat in enumerate(material_groups.keys())}
+        ordered_materials = sorted(
+            material_groups.keys(),
+            key=lambda mat: (
+                obs_order_index.get(_norm_part(mat), len(obs_order_index) + insertion_index[mat]),
+                insertion_index[mat],
+            ),
+        )
+        
+        for material_number in ordered_materials:
+            group = material_groups[material_number]
+            group_rows = group['rows']
+            total_sched_qty = 0.0
+            total_gr_qty = 0.0
+            total_open_qty = 0.0
+            for row in group_rows:
+                try:
+                    total_sched_qty += float(row.get('scheduled_qty') or 0)
+                    total_gr_qty += float(row.get('gr_quantity') or 0)
+                    total_open_qty += float(row.get('open_quantity') or 0)
+                except Exception:
+                    pass
+
+            parent_item = QTreeWidgetItem([
+                material_number,
+                group.get('description', ''),
+                '',
+                '',
+                '',
+                '',
+                fmt_value(total_sched_qty),
+                fmt_value(total_gr_qty),
+                fmt_value(total_open_qty),
+                '',
+                '',
+                '',
+                '',
+                '',
+                '',
+                '',
+                '',
+                '',
+            ])
+            font = parent_item.font(0)
+            font.setBold(True)
             
-            # Add cells
-            cells = [
-                part_number,
-                pace,
-                po_number,
-                str(lead_time_days),
-                po_qty,
-                gr_qty,
-                open_qty,
-                po_creation_date,
-                delivery_date,
-                need_by_date,
-                buyer,
-                str(remaining_days),
-                recommendation
-            ]
+            # Get cholesterol color for this material
+            cholesterol = self._get_cholesterol_status_for_material(material_number)
+            if cholesterol == 'Good Cholesterol':
+                bg = QBrush(QColor('#D9F7EF'))
+                fg = QBrush(QColor('#0B6B50'))
+            else:
+                bg = QBrush(QColor('#FDE8E4'))
+                fg = QBrush(QColor('#9B2C2C'))
             
-            for col_idx, cell_value in enumerate(cells):
-                item = QTableWidgetItem(cell_value)
-                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            for idx in range(self.po_table.columnCount()):
+                parent_item.setFont(idx, font)
+                parent_item.setBackground(idx, bg)
+                parent_item.setForeground(idx, fg)
+                # Center align all parent headers
+                parent_item.setTextAlignment(idx, Qt.AlignmentFlag.AlignCenter)
+            self.po_table.addTopLevelItem(parent_item)
+
+            for po_row in group_rows:
+                pace = str(po_row.get('pace', '') or '').strip()
+                sng_status = str(po_row.get('sng_status', '') or '').strip()
+                po_number = str(po_row.get('po_number', '') or '').strip()
+                plant = str(po_row.get('plant', '') or '').strip()
+                lead_time_days = int(po_row.get('lead_time_days', 0) or 0)
+                po_age_days = int(po_row.get('po_age_days', 0) or 0)
+                balance_days = int(po_row.get('balance_days_to_delivery', 0) or 0)
+                po_age_pct = float(po_row.get('po_age_pct', 0) or 0)
+
+                po_status = str(po_row.get('po_status', '') or '').strip()
                 
-                # Color code recommendation column
-                if col_idx == 12:  # Recommendation column
-                    if '✅' in cell_value:
-                        item.setBackground(QColor('#DCFCE7'))  # Light green
-                        item.setForeground(QColor('#166534'))  # Dark green
-                    elif '❌' in cell_value:
-                        item.setBackground(QColor('#FEE2E2'))  # Light red
-                        item.setForeground(QColor('#991B1B'))  # Dark red
+                row_values = [
+                    '',
+                    '',
+                    po_number,
+                    sng_status,
+                    pace,
+                    plant,
+                    fmt_value(po_row.get('scheduled_qty')),
+                    fmt_value(po_row.get('gr_quantity')),
+                    fmt_value(po_row.get('open_quantity')),
+                    fmt_date(po_row.get('po_creation_date')),
+                    fmt_date(po_row.get('delivery_date')),
+                    fmt_date(po_row.get('need_by_date')),
+                    fmt_money(po_row.get('price_usd')),
+                    po_status,
+                    str(lead_time_days),
+                    str(po_age_days),
+                    '',
+                    str(balance_days),
+                ]
+
+                child_item = QTreeWidgetItem(row_values)
+                
+                # Keep PO rows white
+                for idx in range(self.po_table.columnCount()):
+                    # Left align Description column (index 1)
+                    if idx == 1:
+                        child_item.setTextAlignment(idx, Qt.AlignmentFlag.AlignLeft)
                     else:
-                        item.setForeground(QColor('#92400E'))
+                        child_item.setTextAlignment(idx, Qt.AlignmentFlag.AlignCenter)
+                    
+                    # Keep PO detail rows white background
+                    child_item.setBackground(idx, QBrush(QColor('#FFFFFF')))
                 
-                self.po_table.setItem(row_idx, col_idx, item)
-            
-            # Add to visualization list on the left
-            viz_text = f"PO {po_number}\n{remaining_days}d"
-            viz_item = QListWidgetItem(viz_text)
-            viz_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            
-            # Color code based on remaining days vs 80% of lead time
-            if remaining_days < 0:
-                # Overdue
-                viz_item.setBackground(QColor('#FEE2E2'))  # Red
-                viz_item.setForeground(QColor('#991B1B'))
-            elif lead_time_days > 0 and remaining_days < int(lead_time_days * 0.8):
-                # Less than 80% of lead time remaining
-                viz_item.setBackground(QColor('#FEF08A'))  # Yellow
-                viz_item.setForeground(QColor('#713F12'))
-            else:
-                # OK
-                viz_item.setBackground(QColor('#D1FAE5'))  # Green
-                viz_item.setForeground(QColor('#065F46'))
-            
-            self.po_viz_list.addItem(viz_item)
+                parent_item.addChild(child_item)
+
+                age_widget = make_age_bar_widget(po_age_pct)
+                self.po_table.setItemWidget(child_item, 16, age_widget)
+                age_widget.setStyleSheet(age_widget.styleSheet() + '; background-color: white;')
+                if po_age_pct < 20:
+                    child_item.setToolTip(16, f'PO Age {po_age_pct:.1f}% of LT')
+                else:
+                    child_item.setToolTip(16, f'PO Age {po_age_pct:.1f}% of LT')
+
+        self.po_table.expandToDepth(0)
+        self.po_table.resizeColumnToContents(0)
+        self.po_table.resizeColumnToContents(1)
+        self.po_table.resizeColumnToContents(2)
+        self.po_table.resizeColumnToContents(3)
+        self.po_table.resizeColumnToContents(4)
+        self.po_table.resizeColumnToContents(5)
+        self.po_table.resizeColumnToContents(6)
+        self.po_table.resizeColumnToContents(7)
+        self.po_table.resizeColumnToContents(8)
+        self.po_table.resizeColumnToContents(9)
+        self.po_table.resizeColumnToContents(10)
+        self.po_table.resizeColumnToContents(11)
+        self.po_table.resizeColumnToContents(12)
+        self.po_table.resizeColumnToContents(13)
+        self.po_table.resizeColumnToContents(14)
+        self.po_table.resizeColumnToContents(15)
+        self.po_table.setColumnWidth(16, 85)
+        self.po_table.resizeColumnToContents(17)
         
-        # Resize columns to content
-        self.po_table.resizeColumnsToContents()
-        self.po_table.setColumnWidth(12, 200)  # Wider recommendation column
-        
-        self.po_status.setText(f'Displaying {len(po_rows)} open purchase order(s).')
+        self.po_status.setText(f'Displaying {len(po_rows)} open purchase order(s) across {len(material_groups)} material(s).')
         self.po_load_info.setText(f"Load Date & Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+    def _get_cholesterol_status_for_material(self, material_number: str) -> str:
+        """Get the cholesterol status for a material from the inventory cost dataframe."""
+        if self.df is None or self.df.empty:
+            return 'Bad Cholesterol'  # Default to bad if no data
+        
+        def _norm_part(value: Any) -> str:
+            return re.sub(r'[^A-Z0-9]', '', str(value or '').strip().upper())
+
+        target_key = _norm_part(material_number)
+        if not target_key or 'Material Number' not in self.df.columns:
+            return 'Bad Cholesterol'
+
+        # Find the material in the dataframe and compute cholesterol the same way as OBS/Inventory.
+        try:
+            material_keys = self.df['Material Number'].astype(str).apply(_norm_part)
+            material_rows = self.df[material_keys == target_key]
+            if material_rows.empty:
+                return 'Bad Cholesterol'  # Default to bad if material not found
+            
+            sample_row = material_rows.iloc[0]
+            cholesterol = str(sample_row.get('Cholesterol', '') or '').strip()
+            if cholesterol not in ('Good Cholesterol', 'Bad Cholesterol'):
+                metrics = self._compute_cholesterol_metrics(sample_row)
+                cholesterol = str(metrics.get('Cholesterol', '') or '').strip()
+
+            if cholesterol == 'Good Cholesterol':
+                return 'Good Cholesterol'
+            else:
+                return 'Bad Cholesterol'
+        except Exception:
+            return 'Bad Cholesterol'  # Default to bad on error
 
     def _on_subtab_changed(self, idx: int):
         tab_name = self.subtabs.tabText(idx)
@@ -7693,6 +7837,7 @@ class InventoryCostTab(QWidget):
             # Log the extracted parts for debugging
             print(f"DEBUG: Extracted {len(obs_parts)} OBS parts from OBS List tab")
             print(f"DEBUG: First 10 parts: {obs_parts[:10]}")
+            self._obs_parts_order = [str(p or '').strip() for p in obs_parts if str(p or '').strip()]
             
             # Fetch data from Databricks
             QMessageBox.information(self, 'Loading', f'Fetching data for {len(obs_parts)} OBS part(s) from Databricks...')
@@ -7812,10 +7957,9 @@ class InventoryCostTab(QWidget):
             # Fetch Open PO data
             try:
                 if fetch_open_purchase_order_details is not None:
-                    plants_str = [str(p) for p in PLANTS]
-                    print(f"DEBUG: Fetching PO data for {len(obs_parts)} parts across plants: {plants_str}")
+                    print(f"DEBUG: Fetching PO data for {len(obs_parts)} parts across all plants")
                     print(f"DEBUG: OBS Parts list: {obs_parts[:5]}...")  # Show first 5 for debugging
-                    self.po_rows = fetch_open_purchase_order_details(obs_parts, plants=plants_str)
+                    self.po_rows = fetch_open_purchase_order_details(obs_parts)
                     print(f"DEBUG: PO fetch returned {len(self.po_rows)} rows")
                 else:
                     self.po_rows = []
@@ -8381,28 +8525,34 @@ class InventoryCostTab(QWidget):
             
             # Reorder columns for better readability
             column_order = [
-                'part_number', 'pace_dash', 'po_number', 'po_creation_date',
-                'delivery_date', 'need_by_date', 'lead_time_days', 'remaining_days_to_delivery',
-                'po_quantity', 'gr_quantity', 'open_qty', 'supplier_name', 'buyer_code'
+                'material_number', 'description', 'sng_status', 'pace', 'po_number', 'plant',
+                'scheduled_qty', 'gr_quantity', 'open_quantity', 'po_creation_date',
+                'delivery_date', 'need_by_date', 'price_usd', 'po_status', 'lead_time_days', 'po_age_days',
+                'po_age_pct', 'balance_days_to_delivery'
             ]
             available_columns = [c for c in column_order if c in df.columns]
             df = df[available_columns]
             
             # Rename columns for display
             column_names = {
-                'part_number': 'Part Number',
-                'pace_dash': 'PACE',
+                'material_number': 'Material Number',
+                'description': 'Description',
+                'sng_status': 'SNG Status',
+                'pace': 'PACE',
                 'po_number': 'PO Number',
+                'plant': 'Plant',
+                'scheduled_qty': 'Scheduled Qty',
+                'gr_quantity': 'GR Qty',
+                'open_quantity': 'Open Qty',
                 'po_creation_date': 'PO Creation Date',
                 'delivery_date': 'Delivery Date',
                 'need_by_date': 'Need By Date',
-                'lead_time_days': 'Lead Time (days)',
-                'remaining_days_to_delivery': 'Remaining Days',
-                'po_quantity': 'PO Qty',
-                'gr_quantity': 'GR Qty',
-                'open_qty': 'Open Qty',
-                'supplier_name': 'Supplier',
-                'buyer_code': 'Buyer'
+                'price_usd': 'Price (USD)',
+                'po_status': 'PO Status',
+                'lead_time_days': 'Lead Time (LT)',
+                'po_age_days': 'PO Age (Days)',
+                'po_age_pct': 'PO Age %',
+                'balance_days_to_delivery': 'Balance Days to Delivery'
             }
             df = df.rename(columns=column_names)
             

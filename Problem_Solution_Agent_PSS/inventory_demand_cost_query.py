@@ -355,7 +355,7 @@ def fetch_open_purchase_order_details(
 ) -> list[dict[str, Any]]:
     """Return open PO detail rows for the requested part/plant combinations using star schema tables."""
     cleaned_parts = _clean_parts(parts)
-    cleaned_plants = _clean_plants(plants)
+    cleaned_plants = _clean_plants(plants) if plants is not None else []
     if not cleaned_parts:
         raise ValueError("At least one part number is required.")
 
@@ -366,103 +366,48 @@ def fetch_open_purchase_order_details(
             "pyodbc is not installed. Install it with: pip install pyodbc"
         ) from exc
 
-    normalized_parts = sorted({part.replace('-', '') for part in cleaned_parts if part})
-    part_filter = ", ".join(f"'{part}'" for part in normalized_parts)
+    part_filter = ", ".join(f"'{part}'" for part in cleaned_parts)
     plant_filter = ", ".join(f"'{plant}'" for plant in cleaned_plants)
+    plant_clause = f"AND fp.plantcd IN ({plant_filter})" if cleaned_plants else ""
     
     # Use star schema tables: factposl (line items) + factpol (PO headers)
     sql = f"""
-WITH open_po_obs AS (
-    SELECT
-        fp.materialnum AS part_number,
-        fp.plantcd AS plant,
-        fp.pocd AS po_number,
-        fp.polcd AS po_line_number,
-        CAST(COALESCE(fp.dueqty, 0) AS DECIMAL(18, 3)) AS po_quantity,
-        CAST(
-            CASE
-                WHEN COALESCE(fp.dueqty, 0) >= COALESCE(fp.openqty, 0)
-                THEN COALESCE(fp.dueqty, 0) - COALESCE(fp.openqty, 0)
-                ELSE 0
-            END AS DECIMAL(18, 3)
-        ) AS gr_quantity,
-        CAST(COALESCE(fp.openqty, 0) AS DECIMAL(18, 3)) AS open_qty,
-        COALESCE(pol.vndr_name, '') AS supplier_name,
-        COALESCE(pol.pg_code, '') AS buyer_code,
-        TRY_CAST(pol.po_date AS DATE) AS po_creation_date,
-        -- Use commitment date (original or current)
-        CASE
-            WHEN fp.orgnlcmmitdate != '1900-01-01' AND TRY_CAST(fp.orgnlcmmitdate AS DATE) IS NOT NULL 
-            THEN TRY_CAST(fp.orgnlcmmitdate AS DATE)
-            WHEN fp.cmmitdate != '1900-01-01' AND TRY_CAST(fp.cmmitdate AS DATE) IS NOT NULL 
-            THEN TRY_CAST(fp.cmmitdate AS DATE)
-            WHEN fp.needbydate != '1900-01-01' AND TRY_CAST(fp.needbydate AS DATE) IS NOT NULL 
-            THEN TRY_CAST(fp.needbydate AS DATE)
-            ELSE NULL
-        END AS delivery_date,
-        TRY_CAST(fp.needbydate AS DATE) AS need_by_date,
-        -- PACE/DASH classification
-        CASE
-            WHEN UPPER(COALESCE(mm.mrpprfl, '')) LIKE 'SGP%' THEN 'PACE'
-            WHEN UPPER(COALESCE(mm.mrpprfl, '')) LIKE 'GDS%' THEN 'DASH'
-            ELSE ''
-        END AS pace_dash,
-        ROW_NUMBER() OVER (
-            PARTITION BY fp.materialnum
-            ORDER BY
-                -- Only OPEN POs
-                CASE WHEN pol.status = 'OPEN' THEN 0 ELSE 1 END ASC,
-                -- Plant priority
-                CASE
-                    WHEN fp.plantcd IN ('4060','4070','4080','4090') THEN 0
-                    WHEN fp.plantcd IN ('4020','4030','4055') THEN 1
-                    ELSE 2
-                END ASC,
-                -- Closest relevant date
-                CASE
-                    WHEN fp.orgnlcmmitdate != '1900-01-01' AND TRY_CAST(fp.orgnlcmmitdate AS DATE) IS NOT NULL 
-                    THEN ABS(DATEDIFF(DAY, CAST(GETDATE() AS DATE), TRY_CAST(fp.orgnlcmmitdate AS DATE)))
-                    WHEN fp.cmmitdate != '1900-01-01' AND TRY_CAST(fp.cmmitdate AS DATE) IS NOT NULL 
-                    THEN ABS(DATEDIFF(DAY, CAST(GETDATE() AS DATE), TRY_CAST(fp.cmmitdate AS DATE)))
-                    WHEN fp.needbydate != '1900-01-01' AND TRY_CAST(fp.needbydate AS DATE) IS NOT NULL 
-                    THEN ABS(DATEDIFF(DAY, CAST(GETDATE() AS DATE), TRY_CAST(fp.needbydate AS DATE)))
-                    ELSE 999999
-                END ASC
-        ) AS rn
-    FROM prd.pd_mm.factposl fp
-    INNER JOIN prd.pd_mm.factpol pol
-        ON pol.pocd = fp.pocd
-        AND pol.rflg = 1
-    LEFT JOIN prd.pd_mm.factplantmaterial mm
-        ON mm.materialnum = fp.materialnum
-        AND mm.plantcd = fp.plantcd
-        AND mm.rflg = 1
-    WHERE REPLACE(TRIM(CAST(fp.materialnum AS STRING)), '-', '') IN ({part_filter})
-        AND CAST(fp.plantcd AS STRING) IN ({plant_filter})
-        AND fp.rflg = 1
-        AND UPPER(COALESCE(pol.status, '')) LIKE 'OPEN%'
-        AND COALESCE(fp.openqty, 0) > 0
-)
 SELECT
-    part_number,
-    plant,
-    po_number,
-    po_line_number,
-    po_quantity,
-    gr_quantity,
-    open_qty,
-    supplier_name,
-    buyer_code,
-    po_creation_date,
-    delivery_date,
-    need_by_date,
-    CAST(DATEDIFF(DAY, po_creation_date, delivery_date) AS INT) AS lead_time_days,
-    CAST(DATEDIFF(DAY, CAST(GETDATE() AS DATE), delivery_date) AS INT) AS remaining_days_to_delivery,
-    pace_dash
-FROM open_po_obs
-WHERE rn = 1
-ORDER BY part_number, plant, delivery_date DESC, po_number DESC
-""".strip()
+    fp.materialnum AS material_number,
+    COALESCE(pol.shrtdesc, '') AS description,
+    COALESCE(sng.current_sng_status, '') AS sng_status,
+    fp.plantcd AS plant,
+    fp.pocd AS po_number,
+    COALESCE(pace.global_pace_flag, '') AS pace,
+    COALESCE(fp.dueqty, 0) AS scheduled_qty,
+    COALESCE(fp.issdqty, 0) AS gr_quantity,
+    COALESCE(fp.openqty, 0) AS open_quantity,
+    COALESCE(pol.podate, pol.pocdate, pol.cdate) AS po_creation_date,
+    CASE
+        WHEN fp.orgnlcmmitdate != '1900-01-01' THEN fp.orgnlcmmitdate
+        WHEN fp.cmmitdate != '1900-01-01' THEN fp.cmmitdate
+        WHEN fp.needbydate != '1900-01-01' THEN fp.needbydate
+        ELSE NULL
+    END AS delivery_date,
+    fp.needbydate AS need_by_date,
+    COALESCE(pol.netprice, 0) AS price_usd,
+    COALESCE(fp.postatus, '') AS po_status
+FROM prd.pd_mm.factposl fp
+INNER JOIN prd.pd_mm.factpol pol
+    ON pol.pocd = fp.pocd
+    AND pol.polcd = fp.polcd
+    AND pol.rflg = 1
+LEFT JOIN prd.rd_gsspi.emrp_ezcancel sng
+    ON sng.poline = CONCAT(fp.pocd, '_', fp.polcd, '_', fp.poschedulelncd)
+LEFT JOIN prd.ud_agsocebi.pace_part_assignment pace
+    ON pace.material = fp.materialnum
+WHERE fp.materialnum IN ({part_filter})
+    {plant_clause}
+    AND fp.rflg = 1
+    AND pol.status = 'OPEN'
+    AND COALESCE(fp.openqty, 0) > 0
+    AND COALESCE(pol.delind, '') NOT IN ('L', 'D')
+ORDER BY material_number, po_number DESC"""
 
     print(f"DEBUG: PO Query - Parts: {cleaned_parts[:3]}... ({len(cleaned_parts)} total)")
     print(f"DEBUG: PO Query - Plants: {cleaned_plants}")
@@ -477,9 +422,49 @@ ORDER BY part_number, plant, delivery_date DESC, po_number DESC
     finally:
         conn.close()
 
+    from datetime import datetime, timedelta
+    
     results: list[dict[str, Any]] = []
     for row in rows:
         record = {columns[idx]: row[idx] for idx in range(len(columns))}
+        
+        # Calculate aging metrics
+        po_creation_date = record.get('po_creation_date')
+        delivery_date = record.get('delivery_date')
+        today = datetime.now().date()
+        
+        if po_creation_date and delivery_date:
+            try:
+                if isinstance(po_creation_date, str):
+                    po_creation_date = datetime.strptime(po_creation_date, '%Y-%m-%d').date()
+                if isinstance(delivery_date, str):
+                    delivery_date = datetime.strptime(delivery_date, '%Y-%m-%d').date()
+                
+                lead_time_days = (delivery_date - po_creation_date).days
+                po_age_days = (today - po_creation_date).days
+                
+                if lead_time_days > 0:
+                    po_age_pct = min(100.0, (po_age_days / lead_time_days) * 100.0)
+                else:
+                    po_age_pct = 0.0
+                
+                balance_days = (delivery_date - today).days
+                
+                record['lead_time_days'] = lead_time_days
+                record['po_age_days'] = po_age_days
+                record['po_age_pct'] = round(po_age_pct, 2)
+                record['balance_days_to_delivery'] = balance_days
+            except Exception:
+                record['lead_time_days'] = 0
+                record['po_age_days'] = 0
+                record['po_age_pct'] = 0.0
+                record['balance_days_to_delivery'] = 0
+        else:
+            record['lead_time_days'] = 0
+            record['po_age_days'] = 0
+            record['po_age_pct'] = 0.0
+            record['balance_days_to_delivery'] = 0
+        
         results.append(record)
     return results
 
